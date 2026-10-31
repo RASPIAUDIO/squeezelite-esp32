@@ -4,6 +4,7 @@
 Network audio, high-resolution playback and flexible DSP for the next RASPIAUDIO MnCast.</p>
 
 <p align="center">
+  <a href="https://apps.raspiaudio.com/"><strong>Install from your browser</strong></a> ·
   <a href="#easier-first-install">Easy setup</a> ·
   <a href="#three-ways-to-multiroom">Multiroom</a> ·
   <a href="#esp32-wrover-vs-esp32-s31">WROVER vs S31</a> ·
@@ -94,6 +95,10 @@ not yet claimed as validated for this port. See [validation status](docs/STATUS.
 
 **Flash → connect → listen.** Choose the Wi-Fi setup that suits your build.
 
+Open **[apps.raspiaudio.com](https://apps.raspiaudio.com/)** in Chrome or Edge,
+select **S31 → Squeezelite**, and connect your board by USB.
+The webloader installs the firmware and offers Wi-Fi setup after flashing.
+
 | On-screen QR code | Improv Serial over USB |
 |---|---|
 | **Scan and join** the player's setup Wi-Fi using the QR code displayed in fallback access-point mode. | **Flash and configure** without unplugging the board: choose **Configure Wi-Fi** in the compatible Chrome or Edge web installer. |
@@ -105,8 +110,9 @@ If the captive portal does not open automatically, use the URL shown on screen.
 
 ## Install or build
 
-- Use the local [firmware binaries](firmware/experimental).
-  A public S31 release will be made only after review and approval.
+- Install with the **[RASPIAUDIO webloader](https://apps.raspiaudio.com/)**,
+  or download the [firmware binaries](firmware/experimental) and their checksums.
+  The webloader has its own release cycle; see [installation details](docs/INSTALL.md).
 - Follow [installation instructions](docs/INSTALL.md); **S31/16 MB only**.
 - Compile using the pinned SDK and [fresh-clone build instructions](docs/BUILD.md).
 - Review the successful [fresh-clone build verification](docs/BUILD-VALIDATION.md)
@@ -162,10 +168,11 @@ The LCD is used in landscape 320x240; touchscreen support is not qualified.
 
 ## Development and review
 
-This is the local `codex/s31-port` development branch of the
-[RASPIAUDIO fork](https://github.com/RASPIAUDIOadmin/squeezelite-esp32).
-The public fork currently contains upstream code only. The S31 changes and binaries
-remain local pending review and approval for publication.
+This is the `s31` branch of the
+[RASPIAUDIO fork](https://github.com/RASPIAUDIO/squeezelite-esp32), with complete
+S31 sources, build instructions and firmware binaries. The original ESP32 branch
+is retained as `master-v4.3`. See the [publication checklist](docs/REVIEW.md)
+and [build verification](docs/BUILD-VALIDATION.md).
 
 ## Credits and licenses
 

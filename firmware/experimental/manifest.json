@@ -49,5 +49,7 @@
   "local_review_branch": "codex/s31-port",
   "local_review_source_commit": "e6bafac3ecb9d9c75e460e8b1e35e18f34ac9974",
   "source_equivalence_report": "../../docs/build-validation.json",
-  "publication_status": "local only; awaiting owner review"
+  "publication_status": "owner approved 2026-10-31",
+  "publication_repository": "https://github.com/RASPIAUDIO/squeezelite-esp32",
+  "publication_branch": "s31"
 }

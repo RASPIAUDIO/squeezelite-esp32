@@ -1,4 +1,4 @@
-# Local experimental images — not published
+# S31 firmware binaries
 
 Version: `s31-v0.1.0-exp`, ESP32-S31 Function-CoreBoard-1, 16 MB flash / 16 MB PSRAM,
 32-bit PCM pipeline, onboard ES8311 audio defaults.
@@ -8,7 +8,7 @@ Version: `s31-v0.1.0-exp`, ESP32-S31 Function-CoreBoard-1, 16 MB flash / 16 MB P
 - `recovery.bin`, `bootloader.bin`, `partition-table.bin`, `boot_app0.bin`: individual images.
 - `manifest.json`: offsets, sizes, SHA256 values and build-source provenance.
 - `SHA256SUMS`: checksums for the six binary files.
-- `web-installer-manifest.json`: candidate manifest for a future reviewed installer deployment.
+- `web-installer-manifest.json`: manifest for compatible installers; the RASPIAUDIO webloader is maintained separately.
 
 Follow [installation instructions](../../docs/INSTALL.md), particularly the
 distinction between first installation and settings-preserving application updates.
@@ -17,5 +17,8 @@ Read the [build verification](../../docs/BUILD-VALIDATION.md) and
 flashed in this packaging task. Existing hardware validations refer to the prior
 development firmware, not a new listening test of these exact bytes.
 
-All files remain local pending the owner's review. No S31 release or binary has
-been published to the public fork or to the public web installer.
+Published with the owner's approval in the `s31` branch of
+[RASPIAUDIO/squeezelite-esp32](https://github.com/RASPIAUDIO/squeezelite-esp32).
+For browser installation, use [apps.raspiaudio.com](https://apps.raspiaudio.com/).
+That webloader has its own release cycle; these files retain their original build
+version and hashes.

@@ -24,5 +24,5 @@ test into a guarantee for every source, output or sample-rate combination.
 
 The build19 AirPlay 2 enable/disable control persisted through reboot in API/NVS
 tests. A visual browser test of that specific checkbox was not completed in the
-development session. Public installer deployment is separate from this private release.
+development session. Public installer deployment is separate from this repository release.
 

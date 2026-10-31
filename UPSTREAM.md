@@ -14,14 +14,14 @@
 - Former submodules, now vendored for complete source archives: `docs/vendor-snapshots.json`.
 - Registry dependencies and checksums: `dependencies.lock`.
 
-The public GitHub fork is `RASPIAUDIOadmin/squeezelite-esp32`, with parent
-`sle118/squeezelite-esp32`. The local `codex/s31-port` branch is based on upstream
+The public GitHub fork is `RASPIAUDIO/squeezelite-esp32`, with parent
+`sle118/squeezelite-esp32`. The `s31` branch (prepared locally as `codex/s31-port`) is based on upstream
 `master-v4.3` commit `ee1720c7556ffec5f43329aadd47c20546bdbb79` and retains that history.
 It integrates the S31 distribution snapshot prepared in private commit
 `8e83e08a15dd0598cf1b3a4439dd41b6f2bfb47c`, whose migration provenance is listed above.
 No private research history, credentials, recordings or device backups are imported.
-The S31 branch and binaries remain local until Olivier has reviewed and approved
-publication. The existing private snapshot repository is retained as a backup.
+The owner approved publication of the reviewed S31 branch and binaries on
+2026-10-31. The existing private snapshot repository is retained as a backup.
 The original project structure is kept at the root to make upstream comparison easier.
 To follow upstream locally: `git remote add upstream https://github.com/sle118/squeezelite-esp32.git`.
 

@@ -1,9 +1,10 @@
-# Local review before publication
+# Publication review
 
-User decision: use a real public upstream fork, keep S31 modifications and binaries
-local, review everything before publishing the port. The public fork currently
-contains upstream code only. No S31 branch, tag, binary or release is to be pushed
-until publication is explicitly approved.
+The owner reviewed the README and explicitly approved publishing the S31 sources
+and binaries on 2026-10-31 under **RASPIAUDIO**, not RASPIAUDIOadmin.
+The destination is the existing real fork `RASPIAUDIO/squeezelite-esp32`, branch
+`s31`. The existing `master-v4.3` branch is preserved. The webloader is linked at
+https://apps.raspiaudio.com/ and remains a separately maintained deployment.
 
 ## Read first
 

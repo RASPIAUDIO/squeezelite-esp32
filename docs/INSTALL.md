@@ -4,6 +4,20 @@ These images are for **ESP32-S31, 16 MB flash / 16 MB PSRAM**, not ESP32, S3 or
 Raspberry Pi. Factory defaults use the onboard ES8311 and speaker amplifier.
 Configure the external Audio+ profile separately if that is your connected output.
 
+## Install from your browser
+
+Open [apps.raspiaudio.com](https://apps.raspiaudio.com/) in Chrome or Edge,
+select **S31 → Squeezelite**, and connect the board by USB. After flashing,
+use **Configure Wi-Fi** to select your network and enter its password through
+Improv Serial. Ethernet can also be used directly.
+
+The webloader is maintained in [RASPIAUDIO/raspiaudio.github.io](https://github.com/RASPIAUDIO/raspiaudio.github.io/tree/main/S31/Squeezelite)
+and has its own release cycle. Its current image may differ from this repository's
+fresh-clone build. Use the binaries and SHA256 manifest here when you need this
+exact release.
+
+## Install over the command line
+
 Install esptool 5.6.0 (or use the pinned IDF Python environment). Replace COM21 with
 your actual serial port. Verify image hashes against `SHA256SUMS` first.
 
@@ -22,8 +36,8 @@ python -m esptool --chip esp32s31 --port COM21 write-flash 0x0 firmware/experime
 
 Ethernet can be used directly. For Wi-Fi use Improv Serial in a compatible Chromium
 Web Serial installer, or the fallback access point/captive portal. A Web installer
-manifest is supplied; the custom public RASPIAUDIO installer is maintained separately
-and is not automatically updated by this private release.
+manifest is supplied; publishing this repository does not automatically update
+the separate RASPIAUDIO webloader.
 
 ## Application update: existing matching S31 partition layout only
 

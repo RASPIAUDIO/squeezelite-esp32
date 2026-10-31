@@ -27,17 +27,15 @@ the build directory, without additional SDK edits.
 ## Build from a fresh clone
 
 ```powershell
-git clone --branch codex/s31-port <path-to-local-fork> s31-buildcheck
+git clone --branch s31 https://github.com/RASPIAUDIO/squeezelite-esp32.git s31-buildcheck
 cd s31-buildcheck
 python -m pip install -r scripts/requirements-build.txt
 ./scripts/build.ps1
 python scripts/package.py --build build-s31 --output firmware/experimental
 ```
 
-Until the S31 branch is approved for publication, clone the local fork repository
-as shown above. The public fork at `RASPIAUDIOadmin/squeezelite-esp32` contains
-only the original upstream branches. After publication, its URL can replace
-`<path-to-local-fork>`; do not expect the S31 branch to be available remotely yet.
+The `s31` branch contains the complete S31 source distribution. The original
+ESP32 branch remains available separately as `master-v4.3`.
 
 All project Git dependencies are vendored source snapshots, including the
 modified Sendspin library. Their revisions are in `docs/vendor-snapshots.json`;
