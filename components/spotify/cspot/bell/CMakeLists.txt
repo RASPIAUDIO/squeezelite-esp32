@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.5)
 cmake_policy(SET CMP0077 NEW)
 
 project(bell)
@@ -106,7 +106,10 @@ list(APPEND EXTRA_INCLUDES "main/platform")
 
 # Add platform specific sources
 if(ESP_PLATFORM)
-    file(GLOB ESP_PLATFORM_SOURCES "main/platform/esp/*.cpp" "main/platform/esp/*.c" "main/asm/biquad_f32_ae32.S")
+    file(GLOB ESP_PLATFORM_SOURCES "main/platform/esp/*.cpp" "main/platform/esp/*.c")
+    if(NOT IDF_TARGET STREQUAL "esp32s31")
+        list(APPEND ESP_PLATFORM_SOURCES "main/asm/biquad_f32_ae32.S")
+    endif()
     list(APPEND SOURCES ${ESP_PLATFORM_SOURCES})
 endif()
 

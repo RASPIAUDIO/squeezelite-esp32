@@ -34,62 +34,36 @@ void HTTPClient::Response::rawRequest(const std::string& url,
   // Prepare a request
   const char* reqEnd = "\r\n";
 
-  for (int attempt = 0;; attempt++) {
-    // Reconnect when the socket was never opened, was closed (for example
-    // a keep-alive connection dropped by the server), or the stream is in
-    // a failed state left over from a previous request
-    if (!socketStream.isOpen() || !socketStream.good()) {
-      socketStream.close();
-      socketStream.clear();
-      socketStream.open(urlParser.host, urlParser.port,
-                        urlParser.schema == "https");
-      if (!socketStream.good()) {
-        throw std::runtime_error("Cannot connect to " + urlParser.host);
-      }
-    }
+  socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
+  socketStream << "Host: " << urlParser.host << ":" << urlParser.port << reqEnd;
+  socketStream << "Connection: keep-alive" << reqEnd;
+  socketStream << "Accept: */*" << reqEnd;
 
-    socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
-    socketStream << "Host: " << urlParser.host << ":" << urlParser.port
-                 << reqEnd;
-    socketStream << "Connection: keep-alive" << reqEnd;
-    socketStream << "Accept: */*" << reqEnd;
-
-    // Write content
-    if (content.size() > 0) {
-      socketStream << "Content-Length: " << content.size() << reqEnd;
-    }
-
-    // Write headers
-    for (auto& header : headers) {
-      socketStream << header.first << ": " << header.second << reqEnd;
-    }
-
-    socketStream << reqEnd;
-
-    // Write request body
-    if (content.size() > 0) {
-      socketStream.write((const char*)content.data(), content.size());
-    }
-
-    socketStream.flush();
-
-    // Parse response
-    try {
-      readResponseHeaders();
-      return;
-    } catch (const std::runtime_error&) {
-      // Only retry when the connection itself died (stale keep-alive
-      // socket closed by the server); genuine protocol errors leave the
-      // stream in good state and are rethrown immediately
-      if (attempt >= 1 || socketStream.good()) {
-        throw;
-      }
-      socketStream.close();
-    }
+  // Write content
+  if (content.size() > 0) {
+    socketStream << "Content-Length: " << content.size() << reqEnd;
   }
+
+  // Write headers
+  for (auto& header : headers) {
+    socketStream << header.first << ": " << header.second << reqEnd;
+  }
+
+  socketStream << reqEnd;
+
+  // Write request body
+  if (content.size() > 0) {
+    socketStream.write((const char*)content.data(), content.size());
+  }
+
+  socketStream.flush();
+
+  // Parse response
+  readResponseHeaders();
 }
 
 void HTTPClient::Response::readResponseHeaders() {
+  responseStatus = 0;
   char *method, *path;
   const char* msgPointer;
 
@@ -103,29 +77,15 @@ void HTTPClient::Response::readResponseHeaders() {
     socketStream.getline((char*)httpBuffer.data() + httpBufferAvailable,
                          httpBuffer.size() - httpBufferAvailable);
 
-    // A connection closed by the peer or a socket error leaves the stream
-    // in eof/fail state with nothing extracted. Without this check the
-    // loop spins forever at 100% CPU, as getline() keeps returning
-    // immediately with gcount() == 0 once the stream has failed.
-    if (socketStream.eof() || socketStream.bad() ||
-        socketStream.gcount() == 0) {
-      throw std::runtime_error("Connection closed while reading HTTP headers");
-    }
-
-    // getline() hit the buffer limit before finding '\n'; the stream is in
-    // fail state and no further progress is possible
-    if (socketStream.fail()) {
-      throw std::runtime_error("Response too large");
-    }
+    // EOF / TLS failure must not underflow the CRLF restoration below.
+    if (!socketStream || socketStream.gcount() < 2)
+      throw std::runtime_error("Incomplete HTTP response headers");
 
     prevbuflen = httpBufferAvailable;
     httpBufferAvailable += socketStream.gcount();
 
-    // Restore delimiters: getline() consumed the '\n' and wrote a '\0'
-    // terminator, put "\r\n" back for the parser. Guarded so a 1-byte
-    // first line cannot write before the start of the buffer.
-    if (httpBufferAvailable >= 2)
-      memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
+    // Restore delimiters
+    memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
 
     // Parse the request
     numHeaders = sizeof(phResponseHeaders) / sizeof(phResponseHeaders[0]);
@@ -136,6 +96,7 @@ void HTTPClient::Response::readResponseHeaders() {
                            phResponseHeaders, &numHeaders, prevbuflen);
 
     if (pret > 0) {
+      responseStatus = status;
       break; /* successfully parsed the request */
     } else if (pret == -1)
       throw std::runtime_error("Cannot parse http response");
@@ -207,6 +168,10 @@ void HTTPClient::Response::readRawBody() {
   if (contentSize > 0 && rawBody.size() == 0) {
     rawBody = std::vector<uint8_t>(contentSize);
     socketStream.read((char*)rawBody.data(), contentSize);
+    if (static_cast<size_t>(socketStream.gcount()) != contentSize) {
+      rawBody.clear();
+      throw std::runtime_error("Incomplete HTTP response body");
+    }
   }
 }
 

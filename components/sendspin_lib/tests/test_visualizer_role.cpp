@@ -1,0 +1,736 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "inbound_test_helpers.h"
+#include "platform/time.h"
+#include "protocol_messages.h"
+#include "visualizer_role_impl.h"
+
+#include "test_util.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace sendspin;
+
+namespace {
+
+void put_be16(std::vector<uint8_t>& out, uint16_t val) {
+    out.push_back(static_cast<uint8_t>(val >> 8));
+    out.push_back(static_cast<uint8_t>(val & 0xFF));
+}
+
+}  // namespace
+
+// ============================================================================
+// decode_visualizer_message: the drain thread's per-type validation and parsing
+// ============================================================================
+
+// roles/visualizer/v1.md "Server -> Client: Visualizer Data (Binary)": each wire type carries a
+// fixed payload shape, a payload shorter than that shape is not deliverable, and the downbeat
+// bit is meaningful only while the stream tracks downbeats. Spectrum delivers exactly the
+// negotiated bin count: fewer bins on the wire than negotiated is short, more is trailing data.
+TEST(VisualizerDecode, PerTypePayloadShapes) {
+    struct Row {
+        const char* name;
+        uint8_t wire_type;
+        std::vector<uint8_t> payload;
+        uint8_t negotiated_bins{0};
+        bool tracks_downbeats{false};
+        VisualizerDelivery::Kind expected_kind{VisualizerDelivery::Kind::NONE};
+        std::vector<uint16_t> expected_bins{};
+        std::optional<uint16_t> expected_loudness{};
+        std::optional<bool> expected_downbeat{};
+        std::optional<uint16_t> expected_frequency_hz{};
+        std::optional<uint16_t> expected_amplitude{};
+        std::optional<uint8_t> expected_strength{};
+    };
+
+    const std::vector<Row> rows = {
+        {.name = "Control: loudness is big endian",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+         .payload = {0x12, 0x34},
+         .expected_kind = VisualizerDelivery::Kind::LOUDNESS,
+         .expected_loudness = 0x1234},
+        {.name = "loudness one byte short",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+         .payload = {0x12}},
+        {.name = "beat downbeat bit set while tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x01},
+         .tracks_downbeats = true,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = true},
+        {.name = "beat downbeat bit set while not tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x01},
+         .tracks_downbeats = false,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = false},
+        {.name = "beat downbeat bit clear while tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x00},
+         .tracks_downbeats = true,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = false},
+        {.name = "beat with no payload byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {},
+         .tracks_downbeats = true},
+        {.name = "f_peak carries frequency then amplitude",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
+         .payload = {0x01, 0xB8, 0xBE, 0xEF},
+         .expected_kind = VisualizerDelivery::Kind::F_PEAK,
+         .expected_frequency_hz = 440,
+         .expected_amplitude = 0xBEEF},
+        {.name = "f_peak one byte short of both fields",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
+         .payload = {0x01, 0xB8, 0x00}},
+        {.name = "spectrum delivers the negotiated bin count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 3,
+         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
+         .expected_bins = {10, 20, 30}},
+        {.name = "spectrum ignores bins past the negotiated count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 2,
+         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
+         .expected_bins = {10, 20}},
+        {.name = "spectrum one bin short of the negotiated count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 4},
+        {.name = "spectrum that was never negotiated",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A},
+         .negotiated_bins = 0},
+        {.name = "peak carries one strength byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_PEAK,
+         .payload = {200},
+         .expected_kind = VisualizerDelivery::Kind::PEAK,
+         .expected_strength = 200},
+        {.name = "peak with no payload byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_PEAK,
+         .payload = {}},
+        {.name = "reserved wire type",
+         .wire_type = 21,
+         .payload = {0x00, 0x00, 0x00, 0x00}},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::vector<uint16_t> bins;
+        const uint8_t* payload = row.payload.empty() ? nullptr : row.payload.data();
+
+        auto out = decode_visualizer_message(row.wire_type, payload, row.payload.size(),
+                                             row.negotiated_bins, row.tracks_downbeats, bins);
+
+        EXPECT_EQ(out.kind, row.expected_kind);
+        if (row.expected_loudness.has_value()) {
+            EXPECT_EQ(out.loudness, *row.expected_loudness);
+        }
+        if (row.expected_downbeat.has_value()) {
+            EXPECT_EQ(out.downbeat, *row.expected_downbeat);
+        }
+        if (row.expected_frequency_hz.has_value()) {
+            EXPECT_EQ(out.frequency_hz, *row.expected_frequency_hz);
+        }
+        if (row.expected_amplitude.has_value()) {
+            EXPECT_EQ(out.amplitude, *row.expected_amplitude);
+        }
+        if (row.expected_strength.has_value()) {
+            EXPECT_EQ(out.strength, *row.expected_strength);
+        }
+        if (row.expected_kind == VisualizerDelivery::Kind::SPECTRUM) {
+            EXPECT_EQ(bins, row.expected_bins);
+        }
+    }
+}
+
+// ============================================================================
+// handle_binary: the protocol task hands messages over verbatim, doing no per-type parsing or
+// capping.
+// ============================================================================
+
+namespace {
+
+// A visualizer Impl whose drain list is bound to a ring of its own, without the drain thread, and
+// no client (handle_binary never touches it). Heap-allocated because Impl holds atomics and so is
+// neither copyable nor movable. The stream is marked active and all defined wire types are marked
+// negotiated so handle_binary will accept messages (bits 0-4 = wire types 16-20).
+//
+// handle_stream_start writes the stream config into an InboxSlot, which asserts it has been bound
+// to an Inbox first. Give each Impl its own Inbox and ring with program lifetime: both are
+// non-movable, so a deque (which never relocates existing elements) provides stable addresses
+// that outlive the returned Impl, which only holds pointers to them.
+std::unique_ptr<VisualizerRole::Impl> make_impl() {
+    static std::deque<Inbox> inboxes;
+    static std::deque<InboundRing> rings;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 4096;
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+    impl->stream_active = true;
+    impl->negotiated_types_mask = 0x1F;
+    InboundRing& ring = rings.emplace_back();
+    create_test_ring(ring);
+    EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
+    return impl;
+}
+
+// The message handle_binary receives for wire type `type` carrying `data`: the type byte first.
+std::vector<uint8_t> frame_message(uint8_t type, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> message{type};
+    message.insert(message.end(), data.begin(), data.end());
+    return message;
+}
+
+// Hands `data` to the role as wire type `type`, outside any ring item.
+void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> bytes = frame_message(type, data);
+    InboundMessage message = message_over(bytes);
+    impl.handle_binary(type, message);
+    take_in_ring_order(*impl.drain_task->inbound.ring());
+}
+
+// One item the drain thread would take: its item type (the wire type) and the message bytes it
+// carries.
+struct Entry {
+    uint8_t type{0};
+    std::vector<uint8_t> message;
+    const uint8_t* data{nullptr};
+};
+
+// Takes one item from the drain list, returning it to the ring, or returns false if none is
+// waiting.
+bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
+    void* item = impl.drain_task->inbound.items().take(0);
+    if (item == nullptr) {
+        return false;
+    }
+    const InboundItemHeader* header = inbound_item_header(item);
+    out.type = header->type;
+    const uint8_t* bytes = inbound_item_bytes(item);
+    out.message.assign(bytes, bytes + header->data_offset + header->data_len);
+    out.data = bytes;
+    impl.drain_task->inbound.ring()->return_item(item);
+    return true;
+}
+
+}  // namespace
+
+// The frame reaches the drain thread whole. A frame received into a ring item stays in it; one
+// outside any (reassembled from Noise fragments, or received through the fallback buffer) is
+// copied into an item of its own.
+TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
+    struct Row {
+        const char* name;
+        bool in_ring_item;
+    };
+    const Row rows[] = {{"received into a ring item", true},
+                        {"Control: outside a ring item, copied", false}};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
+
+        // data = [server_ts(8)][loudness(2)], then more than this type defines: the protocol task
+        // neither truncates nor caps, so a spectrum with many bins survives intact.
+        std::vector<uint8_t> data;
+        put_be64(data, 123456);
+        put_be16(data, 0xABCD);
+        data.insert(data.end(), 64, 0xEE);
+        std::vector<uint8_t> bytes = frame_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        InboundMessage message =
+            row.in_ring_item ? receive_into_ring(ring, bytes, 0) : message_over(bytes);
+        const uint8_t* received_at = message.data;
+
+        impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
+        take_in_ring_order(ring);
+
+        Entry entry;
+        ASSERT_TRUE(pop_entry(*impl, entry));
+        EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
+        EXPECT_EQ(entry.message, bytes);
+        EXPECT_TRUE(in_ring_storage(ring, entry.data));
+        EXPECT_EQ(entry.data == received_at, row.in_ring_item)
+            << "the frame was copied out of the item it arrived in";
+    }
+}
+
+// roles/visualizer/v1.md "Visualization Data (Binary)": a frame is delivered display_offset_ms
+// ahead of its display time, or at once when that has passed, and dropped once it is more than the
+// lag bound past that delivery time. A server sends one message per visualization type for each
+// analysis frame, all with the same timestamp, so a slow listener leaves the drain thread
+// reaching the later ones after that timestamp; the bound lets those through.
+TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
+    constexpr int64_t MS = 1000;
+    constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
+    constexpr int64_t NOW = 1'000'000;
+    struct Row {
+        const char* name;
+        int64_t client_ts;
+        int32_t offset_ms;
+        int64_t now;
+        std::optional<int64_t> wait_us;
+    };
+    const Row rows[] = {
+        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, NOW, 50 * MS},
+        {"Control: due exactly now", NOW, 0, NOW, 0},
+        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, NOW, 0},
+        {"Control: at the lag bound", NOW - LAG, 0, NOW, 0},
+        {"past the lag bound", NOW - LAG - 1, 0, NOW, std::nullopt},
+        {"positive offset fires early", NOW + 50 * MS, 15, NOW, 35 * MS},
+        {"negative offset delays", NOW + 50 * MS, -10, NOW, 60 * MS},
+        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, NOW, 0},
+        {"Control: a positive offset moves the bound earlier, at it", NOW + 100 * MS - LAG, 100,
+         NOW, 0},
+        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, NOW,
+         std::nullopt},
+        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, NOW,
+         0},
+        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, NOW,
+         std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms, row.now),
+                  row.wait_us);
+    }
+}
+
+TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {
+    auto impl = make_impl();
+
+    std::vector<uint8_t> data(7, 0);  // fewer than the 8 timestamp bytes
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+
+    Entry entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+TEST(VisualizerHandleBinary, DropsWhenStreamInactive) {
+    auto impl = make_impl();
+    impl->stream_active = false;
+
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0);
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+
+    Entry entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
+    // Only wire types the stream/start negotiated are admitted; a defined-but-unnegotiated type
+    // and a reserved type (which can never be negotiated) are both dropped on the protocol task.
+    auto impl = make_impl();
+    impl->negotiated_types_mask =
+        1U << (SENDSPIN_BINARY_VISUALIZER_LOUDNESS - SENDSPIN_BINARY_VISUALIZER_FIRST);
+
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0042);
+
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data);
+    hand(*impl, 21, data);  // reserved type
+
+    Entry entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+
+    // Control: the negotiated type is still forwarded.
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
+}
+
+/// Counts on_visualizer_stream_start() calls.
+class StreamStartCounter : public VisualizerRoleListener {
+public:
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*config*/) override {
+        ++this->starts;
+    }
+    int starts{0};
+};
+
+// A STREAM_START applies only the config written with its own stamp: a config left in the slot by
+// a stream a teardown ended (taken by a drain on the far side of that teardown) is dropped rather
+// than reported for the next stream. The slot is written with the old stamp directly, the payload
+// such a drain would hold; nothing public interleaves the two threads on demand.
+TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration) {
+    struct Row {
+        const char* name;
+        bool stale;
+        int expected_starts;
+    };
+    const Row rows[] = {{"Control: written under the event's generation", false, 1},
+                        {"written before a teardown", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        StreamStartCounter listener;
+        impl->listener = &listener;
+        const uint32_t before = impl->cleanup_generation.load();
+        impl->cleanup();
+        ServerVisualizerStreamObject config;
+        config.types = {VisualizerDataType::BEAT};
+        const uint32_t current = impl->cleanup_generation.load();
+        impl->event_state->config_slot.write(config, row.stale ? before : current);
+
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
+
+        EXPECT_EQ(listener.starts, row.expected_starts);
+    }
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
+// without a spectrum object has no bin count, so its frames are not deliverable. No wire input
+// reaches this: parse_server_message() drops a visualizer object that advertises spectrum with no
+// valid spectrum config, so the cached count is read out of the Impl and run through the decode
+// the drain thread runs. That the served object governs the count is asserted where a consumer
+// sees it, in ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
+TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothing) {
+    struct Row {
+        const char* name;
+        bool has_object;
+        VisualizerDelivery::Kind expected_kind;
+    };
+    const Row rows[] = {
+        {"Control: a stream carrying the spectrum object delivers its frames", true,
+         VisualizerDelivery::Kind::SPECTRUM},
+        {"the spectrum type with no spectrum object drops every frame", false,
+         VisualizerDelivery::Kind::NONE},
+    };
+
+    // Four bins on the wire, the requested count.
+    const std::vector<uint8_t> payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x28};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->config.stream.spectrum = VisualizerSpectrumConfig{
+            .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+
+        ServerVisualizerStreamObject stream;
+        stream.types = {VisualizerDataType::SPECTRUM};
+        if (row.has_object) {
+            stream.spectrum = impl->config.stream.spectrum;
+        }
+        impl->handle_stream_start(stream);
+        take_in_ring_order(*impl->drain_task->inbound.ring());
+
+        std::vector<uint16_t> bins;
+        auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
+                                             payload.size(), impl->spectrum_bin_count,
+                                             impl->tracks_downbeats, bins);
+        EXPECT_EQ(out.kind, row.expected_kind);
+    }
+}
+
+TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
+    // handle_stream_start derives the admission mask from the advertised types.
+    auto impl = make_impl();
+    impl->negotiated_types_mask = 0;
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::BEAT};
+    impl->handle_stream_start(stream);
+    take_in_ring_order(*impl->drain_task->inbound.ring());
+
+    Entry entry;
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    data.push_back(0x01);
+
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data);
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_BEAT);
+
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+// ============================================================================
+// Stream boundaries: every stream/start, stream/end, stream/clear and teardown recalls the listed
+// frames and moves the role's boundary sequence on.
+// ============================================================================
+
+// A boundary returns the frames listed before it, so only frames sent after the latest one
+// survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). The rows drive the
+// handlers with no drain thread; the held frame is covered by
+// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
+// Gap: a current held frame's resumed wait.
+TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
+    enum class Step { END, START, CLEAR, CLEANUP, FRAME };
+    struct Row {
+        const char* name;
+        std::vector<Step> steps;
+        std::vector<uint8_t> surviving;  // the last payload byte of each frame taken
+    };
+    // Every row first lists two frames of the running stream (payload 0x01); each FRAME step
+    // lists one carrying the next value from 0x02.
+    const Row rows[] = {
+        {"Control: no boundary keeps the running stream's frames", {}, {0x01, 0x01}},
+        {"an end with no stream after it empties the list", {Step::END}, {}},
+        {"an end then a start keeps the new stream's frame",
+         {Step::END, Step::START, Step::FRAME},
+         {0x02}},
+        {"a clear keeps the frame sent after it", {Step::CLEAR, Step::FRAME}, {0x02}},
+        {"a start and its frame followed by an end empties the list",
+         {Step::START, Step::FRAME, Step::END},
+         {}},
+        {"two starts keep only the second stream's frame",
+         {Step::START, Step::FRAME, Step::START, Step::FRAME},
+         {0x03}},
+        {"a teardown then a start keeps the new stream's frame",
+         {Step::CLEANUP, Step::START, Step::FRAME},
+         {0x02}},
+    };
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::LOUDNESS};
+    auto loudness = [](uint8_t value) {
+        std::vector<uint8_t> data;
+        put_be64(data, value);
+        put_be16(data, value);
+        return data;
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(0x01));
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(0x01));
+        uint8_t next_value = 0x02;
+        for (Step step : row.steps) {
+            switch (step) {
+                case Step::END:
+                    impl->handle_stream_end();
+                    break;
+                case Step::START:
+                    impl->handle_stream_start(stream);
+                    break;
+                case Step::CLEAR:
+                    impl->handle_stream_clear();
+                    break;
+                case Step::CLEANUP:
+                    impl->cleanup();
+                    break;
+                case Step::FRAME:
+                    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(next_value++));
+                    break;
+            }
+        }
+
+        std::vector<uint8_t> surviving;
+        void* item = nullptr;
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
+            const InboundItemHeader* header = inbound_item_header(item);
+            surviving.push_back(inbound_item_bytes(item)[header->data_offset + header->data_len - 1]);
+            ring.return_item(item);
+        }
+        EXPECT_EQ(surviving, row.surviving);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "a stale frame kept its charge";
+    }
+}
+
+// A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
+// the old stream's frames are never delivered: cleanup() recalls what the drain thread has not
+// taken, returning it and its quota charge to the shared ring, and a frame the drain thread takes
+// between the generation bump and the recall is dropped by its generation stamp and returned the
+// same way. That window has no observable trigger, so its row moves the generation on directly,
+// leaving the frames listed.
+TEST(VisualizerBoundary, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
+    enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
+    struct Row {
+        const char* name;
+        Teardown teardown;
+        bool listed_before_take;
+        size_t delivered;
+    };
+    const Row rows[] = {
+        {"Control: no teardown", Teardown::NONE, true, 2},
+        {"torn down, recalled by cleanup()", Teardown::CLEANUP, false, 0},
+        {"taken by the drain thread before the recall", Teardown::GENERATION_ONLY, true, 0},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
+        std::vector<uint8_t> data;
+        put_be64(data, 1);
+        put_be16(data, 0x0001);
+        for (int i = 0; i < 2; ++i) {
+            InboundMessage message = receive_into_ring(
+                ring, frame_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data), 0);
+            impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
+        }
+        if (row.teardown == Teardown::CLEANUP) {
+            impl->cleanup();
+        } else if (row.teardown == Teardown::GENERATION_ONLY) {
+            impl->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        EXPECT_EQ(!impl->drain_task->inbound.items().is_empty(), row.listed_before_take);
+        // Taken under the live generation, as the drain thread takes them: a recalled or stale
+        // frame is not delivered, and one left over is.
+        size_t delivered = 0;
+        void* item = nullptr;
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
+            ++delivered;
+            ring.return_item(item);
+        }
+        EXPECT_EQ(delivered, row.delivered);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "a frame of the torn-down stream kept its charge";
+    }
+}
+
+// ============================================================================
+// client/hello and client/state configuration reporting
+// ============================================================================
+
+// roles/visualizer/v1.md splits what the client reports: buffer_capacity is a constant capability
+// in the hello support object, while the requested types, frame-rate cap and spectrum layout are
+// dynamic and go in the client/state visualizer object.
+TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamConfig) {
+    static std::deque<Inbox> inboxes;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 6144;
+    config.stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
+    config.stream.rate_max = 25;
+    config.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+
+    ClientHelloMessage hello;
+    impl->build_hello_fields(hello);
+    ASSERT_EQ(hello.supported_roles.size(), 1u);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::VISUALIZER);
+    ASSERT_TRUE(hello.visualizer_support.has_value());
+    // The advertised capacity is the effective wire-data fraction of the quota: a seventh of
+    // it, since the smallest frame stores in its inbound ring item at up to seven times its wire
+    // size. The server's flow control is sized from this number, so the fraction is spelled out
+    // rather than bounded.
+    EXPECT_EQ(hello.visualizer_support->buffer_capacity, 6144u / 7);
+
+    ClientStateMessage state;
+    impl->build_state_fields(state);
+    ASSERT_TRUE(state.visualizer.has_value());
+    EXPECT_EQ(state.visualizer->types, (std::vector<VisualizerDataType>{
+                                           VisualizerDataType::SPECTRUM,
+                                           VisualizerDataType::BEAT,
+                                       }));
+    EXPECT_EQ(state.visualizer->rate_max, 25);
+    ASSERT_TRUE(state.visualizer->spectrum.has_value());
+    EXPECT_EQ(state.visualizer->spectrum->n_disp_bins, 16);
+    EXPECT_EQ(state.visualizer->spectrum->scale, VisualizerSpectrumScale::LOG);
+
+    // Control: a role that asks for no data still reports the object, so the server knows the
+    // role is configured and streams nothing rather than waiting for a state that never comes.
+    auto quiet = make_impl();
+    ClientStateMessage quiet_state;
+    quiet->build_state_fields(quiet_state);
+    ASSERT_TRUE(quiet_state.visualizer.has_value());
+    EXPECT_TRUE(quiet_state.visualizer->types.empty());
+    EXPECT_FALSE(quiet_state.visualizer->spectrum.has_value());
+}
+
+// ============================================================================
+// start(): a stream configuration the spec forbids refuses to run
+// ============================================================================
+
+namespace {
+
+// A visualizer Impl carrying the given stream configuration, bound to an inbox and otherwise
+// startable (the ring buffer is created from a real capacity).
+std::unique_ptr<VisualizerRole::Impl> make_impl_with_stream(VisualizerStreamConfig stream) {
+    static std::deque<Inbox> inboxes;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 4096;
+    config.stream = std::move(stream);
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+    return impl;
+}
+
+}  // namespace
+
+// roles/visualizer/v1.md "client/state visualizer object": a types list carrying 'spectrum'
+// without a spectrum object, or a rate_max of zero while asking for data, is a protocol error the
+// server closes the connection for, so the role refuses the configuration rather than letting the
+// consumer discover it as a disconnect.
+TEST(VisualizerStartValidation, SpecInvalidStreamConfigRefusesToStart) {
+    const VisualizerSpectrumConfig spectrum{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+
+    struct Row {
+        const char* name;
+        VisualizerStreamConfig stream;
+        bool expected_start;
+    };
+    const std::vector<Row> rows = {
+        {"Control: spectrum object present and a positive rate",
+         VisualizerStreamConfig{.types = {VisualizerDataType::SPECTRUM},
+                                .rate_max = 25,
+                                .spectrum = spectrum},
+         true},
+        {"spectrum type with no spectrum object",
+         VisualizerStreamConfig{.types = {VisualizerDataType::SPECTRUM}, .rate_max = 25}, false},
+        {"zero rate_max while requesting a type",
+         VisualizerStreamConfig{.types = {VisualizerDataType::BEAT}, .rate_max = 0}, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;  // outlives the role, whose drain list links it
+        create_test_ring(ring);
+        auto impl = make_impl_with_stream(row.stream);
+        EXPECT_EQ(impl->start(&ring), row.expected_start);
+        if (row.expected_start) {
+            impl->stop();
+        }
+    }
+}

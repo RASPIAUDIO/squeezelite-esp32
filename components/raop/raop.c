@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include <inttypes.h>
 
 #include "platform.h"
 
@@ -25,6 +26,10 @@
 #include "mdns.h"
 #include "mbedtls/version.h"
 #include <mbedtls/x509.h>
+#if !CONFIG_IDF_TARGET_ESP32S31
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#endif
 #endif
 
 #include "util.h"
@@ -32,6 +37,40 @@
 #include "rtp.h"
 #include "dmap_parser.h"
 #include "log_util.h"
+
+extern log_level	raop_loglevel;
+static log_level 	*loglevel = &raop_loglevel;
+
+#ifndef WIN32
+#if CONFIG_IDF_TARGET_ESP32S31
+int raop_crypto_init(void) { return psa_crypto_init(); }
+#else
+// Application-wide entropy and DRBG contexts for mbedtls
+mbedtls_entropy_context raop_entropy;
+mbedtls_ctr_drbg_context raop_ctr_drbg;
+static bool raop_crypto_initialized = false;
+
+int raop_crypto_init(void) {
+	if (raop_crypto_initialized) {
+		return 0;
+	}
+	
+	mbedtls_entropy_init(&raop_entropy);
+	mbedtls_ctr_drbg_init(&raop_ctr_drbg);
+	int ret = mbedtls_ctr_drbg_seed(&raop_ctr_drbg, mbedtls_entropy_func, &raop_entropy, NULL, 0);
+	if (ret != 0) {
+		LOG_ERROR("Failed to seed RAOP RNG: -0x%04x", -ret);
+		mbedtls_ctr_drbg_free(&raop_ctr_drbg);
+		mbedtls_entropy_free(&raop_entropy);
+		return ret;
+	}
+	
+	raop_crypto_initialized = true;
+	LOG_INFO("RAOP crypto initialized");
+	return 0;
+}
+#endif
+#endif
 
 #define RTSP_STACK_SIZE 	(8*1024)
 #define SEARCH_STACK_SIZE	(3*1024)
@@ -63,7 +102,19 @@ typedef struct raop_ctx_s {
 	struct {
 		char *aesiv, *aeskey;
 		char *fmtp;
+		bool pcm;
 	} rtsp;
+#if CONFIG_MNCAST_SENDSPIN
+    /* RTSP thread only: clients may send these before RECORD. Do not expose
+     * them on another source's display until output ownership is acquired. */
+    struct {
+        bool recording, metadata, progress;
+        char artist[256], album[256], title[256];
+        int elapsed, duration;
+        uint8_t *artwork;
+        int artwork_size;
+    } prepared;
+#endif
 	struct rtp_s *rtp;
 	raop_cmd_cb_t	cmd_cb;
 	raop_data_cb_t	data_cb;
@@ -86,8 +137,6 @@ typedef struct raop_ctx_s {
 } raop_ctx_t;
 
 extern struct mdnsd* glmDNSServer;
-extern log_level	raop_loglevel;
-static log_level 	*loglevel = &raop_loglevel;
 
 #ifdef WIN32
 static void*	rtsp_thread(void *arg);
@@ -106,7 +155,8 @@ static int 		base64_decode(const char *str, void *data);
 
 
 extern char private_key[];
-enum { RSA_MODE_KEY, RSA_MODE_AUTH };
+
+enum { RSA_MODE_KEY, RSA_MODE_AUTH };
 
 static void on_dmap_string(void *ctx, const char *code, const char *name, const char *buf, size_t len);
 
@@ -117,7 +167,8 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 	struct raop_ctx_s *ctx = malloc(sizeof(struct raop_ctx_s));
 	struct sockaddr_in addr;
 	char id[64];
-#ifdef WIN32
+
+#ifdef WIN32
 	socklen_t nlen = sizeof(struct sockaddr);
 	char *txt[] = { "am=airesp32", "tp=UDP", "sm=false", "sv=false", "ek=1",
 					"et=0,1", "md=0,1,2", "cn=0,1", "ch=2",
@@ -183,15 +234,19 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 	getsockname(ctx->sock, (struct sockaddr *) &addr, &nlen);
 	ctx->port = ntohs(addr.sin_port);
 #endif
-	ctx->running = true;
-		memcpy(ctx->mac, mac, 6);
+
+	ctx->running = true;
+	
+	memcpy(ctx->mac, mac, 6);
 	snprintf(id, 64, "%02X%02X%02X%02X%02X%02X@%s", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], name);
-#ifdef WIN32
+
+#ifdef WIN32
 	// seems that Windows snprintf does not add NULL char if actual size > max
 	id[63] = '\0';
 	ctx->svc = mdnsd_register_svc(ctx->svr, id, "_raop._tcp.local", ctx->port, NULL, (const char**) txt);
 	pthread_create(&ctx->thread, NULL, &rtsp_thread, ctx);
-#else
+
+#else
 	LOG_INFO("starting mDNS with %s", id);
 	mdns_service_add(id, "_raop", "_tcp", ctx->port, (mdns_txt_item_t*) txt, sizeof(txt) / sizeof(mdns_txt_item_t));
 	
@@ -427,6 +482,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 	key_data_t headers[16], resp[8] = { {NULL, NULL} };
 	int len;
 	bool success = true;
+	char *status_line = "RTSP/1.0 200 OK";
 	
 	if (!http_parse(sock, method, headers, &body, &len)) {
 		NFREE(body);
@@ -480,6 +536,20 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		NFREE(ctx->rtsp.aeskey);
 		NFREE(ctx->rtsp.aesiv);
 		NFREE(ctx->rtsp.fmtp);
+		ctx->rtsp.pcm = false;
+		// The advertised PCM and ALAC codecs require different packet decoding.
+		// Never feed raw L16 samples into the ALAC entropy decoder.
+		if (!body) {
+			status_line = "RTSP/1.0 400 Bad Request";
+			goto send_response;
+		}
+		if (strcasestr(body, " L16/44100/2")) {
+			ctx->rtsp.pcm = true;
+		} else if (!strcasestr(body, " AppleLossless")) {
+			LOG_WARN("Unsupported RAOP audio format");
+			status_line = "RTSP/1.0 415 Unsupported Media Type";
+			goto send_response;
+		}
 
 		if ((p = strcasestr(body, "rsaaeskey")) != NULL) {
 			unsigned char *aeskey;
@@ -489,21 +559,37 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			base64_pad(p, &padded);
 			aeskey = malloc(strlen(padded));
 			len = base64_decode(padded, aeskey);
-			ctx->rtsp.aeskey = rsa_apply(aeskey, len, &outlen, RSA_MODE_KEY);
+			outlen = 0;
+			ctx->rtsp.aeskey = len > 0 ? rsa_apply(aeskey, len, &outlen, RSA_MODE_KEY) : NULL;
 
 			NFREE(p);
 			NFREE(aeskey);
 			NFREE(padded);
+			if (!ctx->rtsp.aeskey || outlen != 16) {
+				NFREE(ctx->rtsp.aeskey);
+				LOG_ERROR("Rejecting RAOP session: invalid RSA session key");
+				status_line = "RTSP/1.0 400 Bad Request";
+				goto send_response;
+			}
 		}
 
 		if ((p = strcasestr(body, "aesiv")) != NULL) {
 			p = strextract(p, ":", "\r\n");
 			base64_pad(p, &padded);
 			ctx->rtsp.aesiv = malloc(strlen(padded));
-			base64_decode(padded, ctx->rtsp.aesiv);
+			int ivlen = base64_decode(padded, ctx->rtsp.aesiv);
 
 			NFREE(p);
 			NFREE(padded);
+			if (ivlen != 16) {
+				NFREE(ctx->rtsp.aesiv);
+				status_line = "RTSP/1.0 400 Bad Request";
+				goto send_response;
+			}
+		}
+		if (!!ctx->rtsp.aeskey != !!ctx->rtsp.aesiv) {
+			status_line = "RTSP/1.0 400 Bad Request";
+			goto send_response;
 		}
 
 		if ((p = strcasestr(body, "fmtp")) != NULL) {
@@ -537,12 +623,18 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 
 		// we are about to stream, do something if needed and optionally give buffers to play with
 		success = ctx->cmd_cb(RAOP_SETUP, &buffer, &size);
+		if (!success) {
+			// Another transport owns output. Do not allocate buffers/sockets or
+			// start an RTP task for a session we are about to reject.
+			LOG_INFO("[%p]: SETUP rejected, output busy", ctx);
+			goto send_response;
+		}
 
 		if ((p = strcasestr(buf, "timing_port")) != NULL) sscanf(p, "%*[^=]=%hu", &tport);
 		if ((p = strcasestr(buf, "control_port")) != NULL) sscanf(p, "%*[^=]=%hu", &cport);
 
 		rtp = rtp_init(ctx->peer, ctx->latency,	ctx->rtsp.aeskey, ctx->rtsp.aesiv,
-					   ctx->rtsp.fmtp, cport, tport, buffer, size, ctx->cmd_cb, ctx->data_cb);
+					   ctx->rtsp.fmtp, ctx->rtsp.pcm, cport, tport, buffer, size, ctx->cmd_cb, ctx->data_cb);
 						
 		ctx->rtp = rtp.ctx;
 		
@@ -551,7 +643,9 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			asprintf(&transport, "RTP/AVP/UDP;unicast;mode=record;control_port=%u;timing_port=%u;server_port=%u", rtp.cport, rtp.tport, rtp.aport);
 			LOG_DEBUG("[%p]: audio=(%hu:%hu), timing=(%hu:%hu), control=(%hu:%hu)", ctx, 0, rtp.aport, tport, rtp.tport, cport, rtp.cport);
 			kd_add(resp, "Transport", transport);
-			kd_add(resp, "Session", "DEADBEEF");
+			// Decimal token also interoperates with clients that parse Session
+			// numerically (pyatv); this server previously used fixed DEADBEEF.
+			kd_add(resp, "Session", "3735928559");
 			free(transport);
 		} else {
 			success = false;
@@ -573,9 +667,25 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if (buf && (p = strcasestr(buf, "seq")) != NULL) sscanf(p, "%*[^=]=%hu", &seqno);
 		if (buf && (p = strcasestr(buf, "rtptime")) != NULL) sscanf(p, "%*[^=]=%u", &rtptime);
 
-		if (ctx->rtp) rtp_record(ctx->rtp, seqno, rtptime);
-
 		success = ctx->cmd_cb(RAOP_STREAM);
+#if CONFIG_MNCAST_SENDSPIN
+        if (success) {
+            ctx->prepared.recording = true;
+            if (ctx->prepared.metadata)
+                ctx->cmd_cb(RAOP_METADATA, ctx->prepared.artist, ctx->prepared.album, ctx->prepared.title, 0U);
+            if (ctx->prepared.progress)
+                ctx->cmd_cb(RAOP_PROGRESS, ctx->prepared.elapsed, ctx->prepared.duration);
+            if (ctx->prepared.artwork)
+                ctx->cmd_cb(RAOP_ARTWORK, ctx->prepared.artwork, ctx->prepared.artwork_size, 0U);
+            LOG_INFO("Prepared display delivered after RECORD: metadata=%d progress=%d artwork=%d bytes",
+                     ctx->prepared.metadata, ctx->prepared.progress, ctx->prepared.artwork_size);
+            NFREE(ctx->prepared.artwork);
+            ctx->prepared.artwork_size = 0;
+            ctx->prepared.metadata = ctx->prepared.progress = false;
+        }
+#endif
+		/* Do not release buffered RTP until the sink accepts playback. */
+		if (success && ctx->rtp) rtp_record(ctx->rtp, seqno, rtptime);
 
 	}  else if (!strcmp(method, "FLUSH")) {
 		unsigned short seqno = 0;
@@ -615,7 +725,14 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			current = ((current - start) / 44100) * 1000;
 			if (stop) stop = ((stop - start) / 44100) * 1000;
 			LOG_INFO("[%p]: SET PARAMETER progress %d/%u %s", ctx, current, stop, p);
-			success = ctx->cmd_cb(RAOP_PROGRESS, max(current, 0), stop);
+#if CONFIG_MNCAST_SENDSPIN
+            if (!ctx->prepared.recording) {
+                ctx->prepared.elapsed = max(current, 0);
+                ctx->prepared.duration = stop;
+                ctx->prepared.progress = true;
+            } else
+#endif
+                success = ctx->cmd_cb(RAOP_PROGRESS, max(current, 0), stop);
 		} else if (body && ((p = kd_lookup(headers, "Content-Type")) != NULL) && !strcasecmp(p, "application/x-dmap-tagged")) {
 			struct metadata_s metadata;
 			dmap_settings settings = {
@@ -627,18 +744,39 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			memset(&metadata, 0, sizeof(struct metadata_s));
 			if (!dmap_parse(&settings, body, len)) {
                 uint32_t timestamp = 0;
-                if ((p = kd_lookup(headers, "RTP-Info")) != NULL) sscanf(p, "%*[^=]=%d", &timestamp);
+                if ((p = kd_lookup(headers, "RTP-Info")) != NULL) sscanf(p, "%*[^=]=" "%" SCNu32, &timestamp);
 				LOG_INFO("[%p]: received metadata (ts: %d)\n\tartist: %s\n\talbum:  %s\n\ttitle:  %s",
 						 ctx, timestamp, metadata.artist ? metadata.artist : "", metadata.album ? metadata.album : "", 
                          metadata.title ? metadata.title : "");
-                success = ctx->cmd_cb(RAOP_METADATA, metadata.artist, metadata.album, metadata.title, timestamp);
+#if CONFIG_MNCAST_SENDSPIN
+                if (!ctx->prepared.recording) {
+                    snprintf(ctx->prepared.artist, sizeof(ctx->prepared.artist), "%s", metadata.artist ? metadata.artist : "");
+                    snprintf(ctx->prepared.album, sizeof(ctx->prepared.album), "%s", metadata.album ? metadata.album : "");
+                    snprintf(ctx->prepared.title, sizeof(ctx->prepared.title), "%s", metadata.title ? metadata.title : "");
+                    ctx->prepared.metadata = true;
+                } else
+#endif
+                    success = ctx->cmd_cb(RAOP_METADATA, metadata.artist, metadata.album, metadata.title, timestamp);
 				free_metadata(&metadata);
 			}
 		} else if (body && ((p = kd_lookup(headers, "Content-Type")) != NULL) && strcasestr(p, "image/jpeg")) {			
             uint32_t timestamp = 0;
-            if ((p = kd_lookup(headers, "RTP-Info")) != NULL) sscanf(p, "%*[^=]=%d", &timestamp);
+            if ((p = kd_lookup(headers, "RTP-Info")) != NULL) sscanf(p, "%*[^=]=" "%" SCNu32, &timestamp);
             LOG_INFO("[%p]: received JPEG image of %d bytes (ts:%d)", ctx, len, timestamp);            
-			ctx->cmd_cb(RAOP_ARTWORK, body, len, timestamp);
+#if CONFIG_MNCAST_SENDSPIN
+            if (!ctx->prepared.recording) {
+                NFREE(ctx->prepared.artwork);
+                ctx->prepared.artwork_size = 0;
+                if (len > 0 && len <= 64 * 1024) {
+                    ctx->prepared.artwork = malloc(len);
+                    if (ctx->prepared.artwork) {
+                        memcpy(ctx->prepared.artwork, body, len);
+                        ctx->prepared.artwork_size = len;
+                    }
+                }
+            } else
+#endif
+                ctx->cmd_cb(RAOP_ARTWORK, body, len, timestamp);
 		} else {
 			char *dump = kd_dump(headers);
 			LOG_INFO("Unhandled SET PARAMETER\n%s", dump);
@@ -646,12 +784,18 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 	}
 
+	// RAOP 1 does not implement AirPlay 2 GET /info or POST endpoints. An empty
+	// 200 falsely promises a plist and breaks clients such as pyatv 0.18.
+	if (!strcmp(method, "GET") || !strcmp(method, "POST"))
+		status_line = "RTSP/1.0 501 Not Implemented";
+
+send_response:
 	// don't need to free "buf" because kd_lookup return a pointer, not a strdup
 	kd_add(resp, "Audio-Jack-Status", "connected; type=analog");
 	kd_add(resp, "CSeq", kd_lookup(headers, "CSeq"));
 
 	if (success) {
-		buf = http_send(sock, "RTSP/1.0 200 OK", resp);
+		buf = http_send(sock, status_line, resp);
 	} else {
 		buf = http_send(sock, "RTSP/1.0 503 ERROR", NULL);
 		closesocket(sock);
@@ -697,6 +841,10 @@ void cleanup_rtsp(raop_ctx_t *ctx, bool abort) {
 	NFREE(ctx->rtsp.aeskey);
 	NFREE(ctx->rtsp.aesiv);
 	NFREE(ctx->rtsp.fmtp);
+#if CONFIG_MNCAST_SENDSPIN
+    NFREE(ctx->prepared.artwork);
+    memset(&ctx->prepared, 0, sizeof(ctx->prepared));
+#endif
 }	
 
 /*----------------------------------------------------------------------------*/
@@ -770,7 +918,8 @@ static void search_remote(void *args) {
  }
 #endif
 
-/*----------------------------------------------------------------------------*/
+
+/*----------------------------------------------------------------------------*/
 static char *rsa_apply(unsigned char *input, int inlen, int *outlen, int mode)
 {
 	const static char super_secret_key[] =
@@ -820,40 +969,56 @@ static char *rsa_apply(unsigned char *input, int inlen, int *outlen, int mode)
 	RSA_free(rsa);
 
 	return (char*) out;
+#elif CONFIG_IDF_TARGET_ESP32S31
+    return raop_rsa_s31(super_secret_key, input, inlen, outlen, mode == RSA_MODE_AUTH);
 #else
 	mbedtls_pk_context pkctx;
 	mbedtls_rsa_context *trsa;
+	uint8_t *outbuf = NULL;
 	size_t olen;
-	
-	/*
-	we should do entropy initialization & pass a rng function but this
-	consumes a ton of stack and there is no security concern here. Anyway,
-	mbedtls takes a lot of stack, unfortunately ...
-	*/
 
 	mbedtls_pk_init(&pkctx);
-	mbedtls_pk_parse_key(&pkctx, (unsigned char *)super_secret_key,
-		sizeof(super_secret_key), NULL, 0);
+	int ret = mbedtls_pk_parse_key(&pkctx, (unsigned char *)super_secret_key,
+								   sizeof(super_secret_key), NULL, 0, mbedtls_ctr_drbg_random, &raop_ctr_drbg);
+	if (ret != 0)
+	{
+		LOG_ERROR("Failed to parse RSA key: -0x%04x", -ret);
+		mbedtls_pk_free(&pkctx);
+		return NULL;
+	}
 
-	uint8_t *outbuf = NULL;
 	trsa = mbedtls_pk_rsa(pkctx);
+	size_t rsa_len = mbedtls_rsa_get_len(trsa);
 
 	switch (mode) {
 	case RSA_MODE_AUTH:
 		mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V15, MBEDTLS_MD_NONE);
-		outbuf = malloc(trsa->len);
-		mbedtls_rsa_pkcs1_encrypt(trsa, NULL, NULL, MBEDTLS_RSA_PRIVATE, inlen, input, outbuf);
-		*outlen = trsa->len;
+		outbuf = malloc(rsa_len);
+		ret = mbedtls_rsa_pkcs1_encrypt(trsa, mbedtls_ctr_drbg_random, &raop_ctr_drbg, inlen, input, outbuf);
+		if (ret != 0)
+		{
+			LOG_ERROR("RSA encrypt failed: -0x%04x", -ret);
+			free(outbuf);
+			outbuf = NULL;
+		}
+		*outlen = rsa_len;
 		break;
 	case RSA_MODE_KEY:
 		mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
-		outbuf = malloc(trsa->len);
-		mbedtls_rsa_pkcs1_decrypt(trsa, NULL, NULL, MBEDTLS_RSA_PRIVATE, &olen, input, outbuf, trsa->len);
+		outbuf = malloc(rsa_len);
+		ret = mbedtls_rsa_pkcs1_decrypt(trsa, mbedtls_ctr_drbg_random, &raop_ctr_drbg, &olen, input, outbuf, rsa_len);
+		if (ret != 0)
+		{
+			LOG_ERROR("RSA decrypt failed: -0x%04x", -ret);
+			free(outbuf);
+			outbuf = NULL;
+		}
 		*outlen = olen;
 		break;
 	}
 
 	mbedtls_pk_free(&pkctx);
+	// Note: raop_entropy and raop_ctr_drbg are global, kept alive for reuse
 
 	return (char*) outbuf;
 #endif
@@ -869,7 +1034,7 @@ static int  base64_pad(char *src, char **padded)
 {
 	int n;
 
-	n = strlen(src) + strlen(src) % 4;
+	n = (strlen(src) + 3) & ~3;
 	*padded = malloc(n + 1);
 	memset(*padded, '=', n);
 	memcpy(*padded, src, strlen(src));

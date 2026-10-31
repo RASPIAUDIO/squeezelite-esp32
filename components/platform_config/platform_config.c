@@ -27,7 +27,7 @@
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_vfs_dev.h"
-#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "linenoise/linenoise.h"
 #include "argtable3/argtable3.h"
 
@@ -43,13 +43,13 @@
 #define CONFIG_COMMIT_DELAY 1000
 #define LOCK_MAX_WAIT 20*CONFIG_COMMIT_DELAY
 static const char * TAG = "config";
-EXT_RAM_ATTR static cJSON * nvs_json=NULL;
-EXT_RAM_ATTR static TimerHandle_t timer;
-EXT_RAM_ATTR static SemaphoreHandle_t config_mutex = NULL;
-EXT_RAM_ATTR static EventGroupHandle_t config_group;
+EXT_RAM_BSS_ATTR static cJSON * nvs_json=NULL;
+EXT_RAM_BSS_ATTR static TimerHandle_t timer;
+EXT_RAM_BSS_ATTR static SemaphoreHandle_t config_mutex = NULL;
+EXT_RAM_BSS_ATTR static EventGroupHandle_t config_group;
 /* @brief indicate that the ESP32 is currently connected. */
-EXT_RAM_ATTR static const int CONFIG_NO_COMMIT_PENDING = BIT0;
-EXT_RAM_ATTR static const int CONFIG_LOAD_BIT = BIT1;
+EXT_RAM_BSS_ATTR static const int CONFIG_NO_COMMIT_PENDING = BIT0;
+EXT_RAM_BSS_ATTR static const int CONFIG_LOAD_BIT = BIT1;
 
 bool config_lock(TickType_t xTicksToWait);
 void config_unlock();
@@ -111,8 +111,8 @@ void config_init(){
 
 void config_start_timer(){
 	ESP_LOGD(TAG, "Starting config timer");
-	timer = xTimerCreate("configTimer", CONFIG_COMMIT_DELAY / portTICK_RATE_MS, pdFALSE, NULL, vCallbackFunction);
-    if( xTimerStart( timer , CONFIG_COMMIT_DELAY/ portTICK_RATE_MS ) != pdPASS )    {
+	timer = xTimerCreate("configTimer", CONFIG_COMMIT_DELAY / portTICK_PERIOD_MS, pdFALSE, NULL, vCallbackFunction);
+    if( xTimerStart( timer , CONFIG_COMMIT_DELAY/ portTICK_PERIOD_MS ) != pdPASS )    {
         ESP_LOGE(TAG, "config commitment timer failed to start.");
     }
 
@@ -656,6 +656,16 @@ void config_get_uint16t_from_str(const char *key, uint16_t *value, uint16_t defa
 }
 
 void * config_alloc_get_str(const char *key, char *lead, char *fallback) {
+#if CONFIG_MNCAST_S31_COREBOARD
+    /* This development board also exposes I2S on J2. Let its saved DAC
+     * profile override the onboard default, consistently for output and UI.
+     * An empty NVS value still selects the compiled ES8311 profile. */
+    if (!strcmp(key, "dac_config")) {
+        char *saved = config_alloc_get_default(NVS_TYPE_STR, key, NULL, 0);
+        if (saved && *saved) return saved;
+        free(saved);
+    }
+#endif
 	if (lead && *lead) return strdup_psram(lead);
 	char *value = config_alloc_get_default(NVS_TYPE_STR, key, NULL, 0);
 	if ((!value || !*value) && fallback) {

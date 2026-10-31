@@ -27,6 +27,7 @@ const static char TAG[] = "ImageDec";
 typedef struct {
     const unsigned char *InData;	// Pointer to jpeg data
     int InPos;						// Current position in jpeg data
+	size_t InLength; // Used only by bounded network-input callback
 	int Width, Height;	
 	uint8_t Mode;
 	union {
@@ -81,6 +82,15 @@ static unsigned InHandler(JDEC *Decoder, uint8_t *Buf, unsigned Len) {
     return Len;
 }
 
+static unsigned InHandlerBounded(JDEC *Decoder, uint8_t *Buf, unsigned Len) {
+    JpegCtx *ctx = (JpegCtx *) Decoder->device;
+    size_t left = ctx->InLength - (size_t)ctx->InPos;
+    if (Len > left) Len = left;
+    if (Buf && Len) memcpy(Buf, ctx->InData + ctx->InPos, Len);
+    ctx->InPos += Len;
+    return Len;
+}
+
 #define OUTHANDLER(F)										\
 	for (int y = Frame->top; y <= Frame->bottom; y++) {		\
 		for (int x = Frame->left; x <= Frame->right; x++) {	\
@@ -102,6 +112,8 @@ static unsigned InHandler(JDEC *Decoder, uint8_t *Buf, unsigned Len) {
 static unsigned OutHandler(JDEC *Decoder, void *Bitmap, JRECT *Frame) {
 	JpegCtx *Context = (JpegCtx*) Decoder->device;
     uint8_t *Pixels = (uint8_t*) Bitmap;
+    if (Frame->right >= Context->Width || Frame->bottom >= Context->Height ||
+        Frame->left > Frame->right || Frame->top > Frame->bottom) return 0;
 
 	// decoded image is RGB888
 	if (Context->Mode == GDS_RGB888) {
@@ -228,6 +240,41 @@ static void* DecodeJPEG(uint8_t *Source, int *Width, int *Height, float Scale, b
 void* GDS_DecodeJPEG(uint8_t *Source, int *Width, int *Height, float Scale, int RGB_Mode) {
 	return DecodeJPEG(Source, Width, Height, Scale, false, RGB_Mode);
 }	
+
+void* GDS_DecodeJPEGBounded(const uint8_t *Source, size_t Length, int *Width,
+                          int *Height, int MaxWidth, int MaxHeight, int RGB_Mode) {
+    if (Width) *Width = 0;
+    if (Height) *Height = 0;
+    if (!Source || Length < 4 || Length > 65536 || MaxWidth < 1 || MaxHeight < 1 ||
+        MaxWidth > 320 || MaxHeight > 320 || RGB_Mode < GDS_GRAYSCALE || RGB_Mode > GDS_RGB888)
+        return NULL;
+    if (Source[0] != 0xff || Source[1] != 0xd8 || Source[Length-2] != 0xff || Source[Length-1] != 0xd9)
+        return NULL;
+    JDEC decoder = {0};
+    JpegCtx ctx = {.InData=Source, .InLength=Length, .Mode=RGB_Mode};
+    void *scratch = malloc(SCRATCH_SIZE);
+    if (!scratch) return NULL;
+    int res = jd_prepare(&decoder, InHandlerBounded, scratch, SCRATCH_SIZE, &ctx);
+    if (res == JDR_OK && decoder.width && decoder.height && decoder.width <= 512 && decoder.height <= 512) {
+        unsigned scale = 0;
+        while (scale < 3 && ((decoder.width >> scale) > MaxWidth || (decoder.height >> scale) > MaxHeight)) ++scale;
+        ctx.Width = decoder.width >> scale;
+        ctx.Height = decoder.height >> scale;
+        if (ctx.Width && ctx.Height && ctx.Width <= MaxWidth && ctx.Height <= MaxHeight) {
+            unsigned bytes = RGB_Mode <= GDS_RGB332 ? 1 : RGB_Mode < GDS_RGB666 ? 2 : 3;
+            ctx.OutData = calloc((size_t)ctx.Width * ctx.Height, bytes);
+            if (ctx.OutData && jd_decomp(&decoder, OutHandler, scale) != JDR_OK) {
+                free(ctx.OutData); ctx.OutData = NULL;
+            }
+        }
+    }
+    free(scratch);
+    if (ctx.OutData) {
+        if (Width) *Width = ctx.Width;
+        if (Height) *Height = ctx.Height;
+    }
+    return ctx.OutData;
+}
 
 void GDS_GetJPEGSize(uint8_t *Source, int *Width, int *Height) {
 	DecodeJPEG(Source, Width, Height, 1, true, -1);

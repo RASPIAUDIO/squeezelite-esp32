@@ -1,10 +1,10 @@
 # the JPEG library is in ROM but seems to fail randomly (PSRAM issue?)
 set(TJPGD tjpgd)
 
-idf_component_register(SRC_DIRS . core core/ifaces  fonts
+idf_component_register(SRC_DIRS . qr core core/ifaces  fonts
 						INCLUDE_DIRS . fonts core
 						REQUIRES platform_config tools esp_common
-						PRIV_REQUIRES services freertos driver ${TJPGD}
+						PRIV_REQUIRES services freertos driver esp_driver_ledc ${TJPGD}
 						EMBED_FILES note.jpg )		
 
 if (NOT TJPGD)

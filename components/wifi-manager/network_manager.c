@@ -10,6 +10,7 @@ Copyright (c) 2017-2021 Sebastien L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include "network_ethernet.h"
 #include "network_status.h"
 #include "network_wifi.h"
@@ -17,6 +18,7 @@ Copyright (c) 2017-2021 Sebastien L
 #include "dns_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "platform_esp32.h"
 
@@ -59,8 +61,7 @@ typedef struct network_callback {
     nm_state_t state;
     int sub_state;
     const char* from;
-    SLIST_ENTRY(network_callback)
-    next;  //!< next callback
+    SLIST_ENTRY(network_callback) next;  //!< next callback
 } network_callback_t;
 
 /** linked list of command structures */
@@ -71,13 +72,13 @@ network_t NM;
 
 //! Create and initialize the array of state machines.
 state_machine_t* const SM[] = {(state_machine_t*)&NM};
-static void network_timer_cb(void* timer_id);
+static void network_timer_cb(TimerHandle_t xTimer);
 int get_root_id(const state_t *  state);
 const state_t* get_root( const state_t* const state);
 static void network_task(void* pvParameters);
 
 void network_start_stop_dhcp_client(esp_netif_t* netif, bool start) {
-    tcpip_adapter_dhcp_status_t status;
+    esp_netif_dhcp_status_t status;
     esp_err_t err = ESP_OK;
     ESP_LOGD(TAG, "Checking if DHCP client for STA interface is running");
     if (!netif) {
@@ -137,7 +138,7 @@ void network_start_stop_dhcp_client(esp_netif_t* netif, bool start) {
     }
 }
 void network_start_stop_dhcps(esp_netif_t* netif, bool start) {
-    tcpip_adapter_dhcp_status_t status;
+    esp_netif_dhcp_status_t status;
     esp_err_t err = ESP_OK;
     ESP_LOGD(TAG, "Checking if DHCP server is running");
     if (!netif) {
@@ -539,9 +540,9 @@ void network_async_connect(const char * ssid, const char * password) {
     memset(&msg,0x00,sizeof(msg));
     msg.trigger = EN_CONNECT_NEW;
     msg.ssid = strdup_psram(ssid);
-    if(password && strlen(password) >0){
-        msg.password = strdup_psram(password);
-    }
+    // Empty is a valid password for an open network; NULL is rejected by
+    // network_wifi_connect(). Preserve it through the asynchronous queue.
+    msg.password = strdup_psram(password ? password : "");
     ESP_LOGD(TAG, "Posting event %s", event_to_string(msg.trigger));
     xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
 }
@@ -588,7 +589,7 @@ network_t* network_get_state_machine() {
     return &NM;
 }
 
-static void network_timer_cb(void* timer_id) {
+static void network_timer_cb(TimerHandle_t xTimer) {
     network_async_timer();
 }
 esp_netif_t* network_get_active_interface() {
@@ -601,7 +602,7 @@ esp_netif_t* network_get_active_interface() {
 }
 bool network_is_interface_connected(esp_netif_t* interface) {
     esp_err_t err = ESP_OK;
-    tcpip_adapter_ip_info_t ipInfo;
+    esp_netif_ip_info_t ipInfo;
     if(!interface){
         return false;
     }
@@ -639,7 +640,7 @@ static esp_netif_t* get_connected_interface() {
     ESP_LOGD(TAG,"No connected interface found");
     return NULL;
 }
-esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_info_t* ipInfo) {
+esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, esp_netif_ip_info_t* ipInfo) {
     esp_netif_ip_info_t loc_ip_info;
     if (!ipInfo ) {
         ESP_LOGE(TAG, "Invalid pointer for ipInfo");
@@ -649,7 +650,7 @@ esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_inf
         ESP_LOGE(TAG, "Invalid pointer for netif");
         return ESP_ERR_INVALID_ARG;
     }
-    memset(ipInfo,0x00,sizeof(tcpip_adapter_ip_info_t));
+    memset(ipInfo,0x00,sizeof(esp_netif_ip_info_t));
     esp_err_t err= esp_netif_get_ip_info(netif, &loc_ip_info);
     if(err==ESP_OK){
         ip4_addr_set(&(ipInfo->ip),&loc_ip_info.ip);
@@ -658,7 +659,7 @@ esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_inf
     }
     return err;
 }
-esp_err_t network_get_ip_info(tcpip_adapter_ip_info_t* ipInfo) {
+esp_err_t network_get_ip_info(esp_netif_ip_info_t* ipInfo) {
     esp_netif_t* netif= get_connected_interface();
     if(netif){
         return network_get_ip_info_for_netif(netif,ipInfo);

@@ -1,0 +1,1210 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// @file TUI client example for sendspin-cpp.
+///
+/// Runs a SendspinClient with a terminal user interface showing playback info,
+/// volume, progress, and keyboard controls.
+///
+/// Usage: ./tui_client [options] [name]
+///   name:  Optional friendly name (default: "TUI Client")
+///
+/// Options:
+///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
+///   -p PORT   Listen on PORT (default: 8928)
+///   -f FORMAT Audio format as codec:rate:bits:channels (repeatable)
+///   -a        Enable unpaired access, so a server can stream without pairing first
+///   -F        The server cannot set the volume, which starts at full scale
+///   -M        The server cannot set the mute state
+///   -V        Disable visualizer
+///   -h        Show usage
+
+#include "tui.h"
+
+#include "sendspin/artwork_role.h"
+#include "sendspin/client.h"
+#include "sendspin/color_role.h"
+#include "sendspin/config.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
+#include "file_persistence_provider.h"
+// The audio sink exists to feed the player, so it follows the player's compile gate as well as
+// PortAudio's availability.
+#if defined(SENDSPIN_HAS_PORTAUDIO) && defined(SENDSPIN_ENABLE_PLAYER)
+#define TUI_CLIENT_HAS_AUDIO_SINK
+#endif
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+#include "portaudio_sink.h"
+#endif
+
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <getopt.h>
+
+#ifdef SENDSPIN_HAS_MDNS
+// IWYU pragma: begin_keep
+// The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl and
+// sys/select.h's select()/fd_set to macOS libc++'s private headers when analyzed on a macOS
+// host toolchain; both are still the correct, portable headers on macOS and Linux CI.
+#include <arpa/inet.h>
+#include <sys/select.h>
+// IWYU pragma: end_keep
+#include <dns_sd.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using namespace sendspin;
+
+static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
+static const char* SENDSPIN_PATH = "/sendspin";
+
+// Null audio write callback (used when PortAudio is not available)
+static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
+    return length;
+}
+
+#ifdef SENDSPIN_HAS_MDNS
+// Manages mDNS service advertisement via dns_sd.h
+class MdnsAdvertiser {
+public:
+    ~MdnsAdvertiser() {
+        stop();
+    }
+
+    bool start(const std::string& name, uint16_t port, const std::string& path) {
+        TXTRecordRef txt;
+        TXTRecordCreate(&txt, 0, nullptr);
+        TXTRecordSetValue(&txt, "path", static_cast<uint8_t>(path.size()), path.c_str());
+        TXTRecordSetValue(&txt, "name", static_cast<uint8_t>(name.size()), name.c_str());
+
+        DNSServiceErrorType err =
+            DNSServiceRegister(&service_ref_, 0, 0, name.c_str(), "_sendspin._tcp", nullptr,
+                               nullptr, htons(port), TXTRecordGetLength(&txt),
+                               TXTRecordGetBytesPtr(&txt), nullptr, nullptr);
+
+        TXTRecordDeallocate(&txt);
+
+        return err == kDNSServiceErr_NoError;
+    }
+
+    void stop() {
+        if (service_ref_ != nullptr) {
+            DNSServiceRefDeallocate(service_ref_);
+            service_ref_ = nullptr;
+        }
+    }
+
+private:
+    DNSServiceRef service_ref_{nullptr};
+};
+
+// Manages mDNS service browsing to discover Sendspin servers via dns_sd.h.
+// Runs a background thread that processes DNS-SD events non-blockingly.
+class MdnsBrowser {
+public:
+    ~MdnsBrowser() {
+        stop();
+    }
+
+    bool start() {
+        DNSServiceErrorType err = DNSServiceBrowse(&browse_ref_, 0, 0, "_sendspin._tcp", nullptr,
+                                                   browse_callback, this);
+        if (err != kDNSServiceErr_NoError) {
+            return false;
+        }
+
+        running_.store(true);
+        thread_ = std::thread([this] { run_loop(); });
+        return true;
+    }
+
+    void stop() {
+        running_.store(false);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        // Clean up all resolve/addr refs
+        {
+            std::lock_guard<std::mutex> lock(resolve_mutex_);
+            for (auto& ref : pending_resolves_) {
+                DNSServiceRefDeallocate(ref);
+            }
+            pending_resolves_.clear();
+        }
+        if (browse_ref_ != nullptr) {
+            DNSServiceRefDeallocate(browse_ref_);
+            browse_ref_ = nullptr;
+        }
+    }
+
+    // Returns a snapshot of currently discovered servers.
+    std::vector<DiscoveredServer> get_servers() const {
+        std::lock_guard<std::mutex> lock(servers_mutex_);
+        std::vector<DiscoveredServer> result;
+        result.reserve(servers_.size());
+        for (const auto& [key, server] : servers_) {
+            result.push_back(server);
+        }
+        return result;
+    }
+
+private:
+    // Key for deduplicating discovered services: name + regtype + domain
+    struct ServiceKey {
+        std::string name;
+        std::string regtype;
+        std::string domain;
+
+        bool operator<(const ServiceKey& o) const {
+            if (name != o.name) return name < o.name;
+            if (regtype != o.regtype) return regtype < o.regtype;
+            return domain < o.domain;
+        }
+    };
+
+    // Context passed through the resolve chain
+    struct ResolveContext {
+        MdnsBrowser* browser;
+        ServiceKey key;
+        std::string name;
+        uint16_t port{0};
+        std::string path;
+    };
+
+    void run_loop() {
+        while (running_.load()) {
+            // Collect all active refs to poll
+            std::vector<DNSServiceRef> refs;
+            refs.push_back(browse_ref_);
+            {
+                std::lock_guard<std::mutex> lock(resolve_mutex_);
+                refs.insert(refs.end(), pending_resolves_.begin(), pending_resolves_.end());
+            }
+
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            int max_fd = -1;
+
+            for (auto ref : refs) {
+                int fd = DNSServiceRefSockFD(ref);
+                if (fd >= 0) {
+                    FD_SET(fd, &read_fds);
+                    if (fd > max_fd) max_fd = fd;
+                }
+            }
+
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;  // 200ms timeout
+
+            int result = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+            if (result > 0) {
+                for (auto ref : refs) {
+                    int fd = DNSServiceRefSockFD(ref);
+                    if (fd >= 0 && FD_ISSET(fd, &read_fds)) {
+                        DNSServiceProcessResult(ref);
+                    }
+                }
+            }
+        }
+    }
+
+    void add_resolve_ref(DNSServiceRef ref) {
+        std::lock_guard<std::mutex> lock(resolve_mutex_);
+        pending_resolves_.push_back(ref);
+    }
+
+    void remove_resolve_ref(DNSServiceRef ref) {
+        std::lock_guard<std::mutex> lock(resolve_mutex_);
+        pending_resolves_.erase(
+            std::remove(pending_resolves_.begin(), pending_resolves_.end(), ref),
+            pending_resolves_.end());
+    }
+
+    static void DNSSD_API browse_callback(DNSServiceRef /*ref*/, DNSServiceFlags flags,
+                                           uint32_t interface_index, DNSServiceErrorType error,
+                                           const char* name, const char* regtype,
+                                           const char* domain, void* context) {
+        if (error != kDNSServiceErr_NoError) return;
+        auto* browser = static_cast<MdnsBrowser*>(context);
+
+        ServiceKey key{name, regtype, domain};
+
+        if (flags & kDNSServiceFlagsAdd) {
+            // Service appeared: resolve it
+            auto* ctx = new ResolveContext{browser, key, name, 0, ""};
+
+            DNSServiceRef resolve_ref = nullptr;
+            DNSServiceErrorType err = DNSServiceResolve(
+                &resolve_ref, 0, interface_index, name, regtype, domain, resolve_callback, ctx);
+            if (err == kDNSServiceErr_NoError) {
+                browser->add_resolve_ref(resolve_ref);
+            } else {
+                delete ctx;
+            }
+        } else {
+            // Service removed
+            std::lock_guard<std::mutex> lock(browser->servers_mutex_);
+            browser->servers_.erase(key);
+        }
+    }
+
+    static void DNSSD_API resolve_callback(DNSServiceRef ref, DNSServiceFlags /*flags*/,
+                                            uint32_t /*interface_index*/, DNSServiceErrorType error,
+                                            const char* /*fullname*/, const char* hosttarget,
+                                            uint16_t port, uint16_t txt_len,
+                                            const unsigned char* txt_record, void* context) {
+        auto* ctx = static_cast<ResolveContext*>(context);
+
+        if (error != kDNSServiceErr_NoError) {
+            ctx->browser->remove_resolve_ref(ref);
+            DNSServiceRefDeallocate(ref);
+            delete ctx;
+            return;
+        }
+
+        ctx->port = ntohs(port);
+
+        // Extract "path" from TXT record
+        uint8_t path_len = 0;
+        const void* path_val =
+            TXTRecordGetValuePtr(txt_len, txt_record, "path", &path_len);
+        if (path_val != nullptr && path_len > 0) {
+            ctx->path = std::string(static_cast<const char*>(path_val), path_len);
+        }
+
+        // Done with resolve ref
+        ctx->browser->remove_resolve_ref(ref);
+        DNSServiceRefDeallocate(ref);
+
+        // Resolve the hostname to an IP address using POSIX getaddrinfo.
+        // DNSServiceGetAddrInfo is a Bonjour extension not available in Avahi on Linux.
+        std::thread([ctx, host = std::string(hosttarget)]() {
+            struct addrinfo hints {};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            struct addrinfo* res = nullptr;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res != nullptr) {
+                char addr_str[INET_ADDRSTRLEN] = {};
+                const auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
+                inet_ntop(AF_INET, &addr_in->sin_addr, addr_str, sizeof(addr_str));
+                freeaddrinfo(res);
+
+                if (addr_str[0] != '\0') {
+                    DiscoveredServer server;
+                    server.name = ctx->name;
+                    server.host = addr_str;
+                    server.port = ctx->port;
+                    server.path = ctx->path;
+
+                    std::lock_guard<std::mutex> lock(ctx->browser->servers_mutex_);
+                    ctx->browser->servers_[ctx->key] = std::move(server);
+                }
+            } else if (res != nullptr) {
+                freeaddrinfo(res);
+            }
+            delete ctx;
+        }).detach();
+    }
+
+    DNSServiceRef browse_ref_{nullptr};
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+
+    mutable std::mutex servers_mutex_;
+    std::map<ServiceKey, DiscoveredServer> servers_;
+
+    std::mutex resolve_mutex_;
+    std::vector<DNSServiceRef> pending_resolves_;
+};
+#endif  // SENDSPIN_HAS_MDNS
+
+// Codecs the -f option accepts in this build
+#ifdef SENDSPIN_ENABLE_OPUS
+static constexpr const char* SUPPORTED_CODECS = "flac, opus, pcm";
+#else
+static constexpr const char* SUPPORTED_CODECS = "flac, pcm";
+#endif
+
+/// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
+/// Returns true on success.
+static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedFormatObject& fmt) {
+    std::istringstream ss(str);
+    std::string codec_str, rate_str, bits_str, channels_str;
+
+    if (!std::getline(ss, codec_str, ':') || !std::getline(ss, rate_str, ':') ||
+        !std::getline(ss, bits_str, ':') || !std::getline(ss, channels_str, ':')) {
+        return false;
+    }
+
+    // Parse codec
+    std::transform(codec_str.begin(), codec_str.end(), codec_str.begin(), ::tolower);
+    if (codec_str == "flac") {
+        fmt.codec = sendspin::SendspinCodecFormat::FLAC;
+    } else if (codec_str == "opus") {
+#ifdef SENDSPIN_ENABLE_OPUS
+        fmt.codec = sendspin::SendspinCodecFormat::OPUS;
+#else
+        fprintf(stderr, "opus is not available: built without SENDSPIN_ENABLE_OPUS\n");
+        return false;
+#endif
+    } else if (codec_str == "pcm") {
+        fmt.codec = sendspin::SendspinCodecFormat::PCM;
+    } else {
+        fprintf(stderr, "Unknown codec: %s (expected one of: %s)\n", codec_str.c_str(),
+                SUPPORTED_CODECS);
+        return false;
+    }
+
+    // Parse numeric fields
+    char* end = nullptr;
+    unsigned long rate = strtoul(rate_str.c_str(), &end, 10);
+    if (*end != '\0' || rate == 0) {
+        fprintf(stderr, "Invalid sample rate: %s\n", rate_str.c_str());
+        return false;
+    }
+    fmt.sample_rate = static_cast<uint32_t>(rate);
+
+    unsigned long bits = strtoul(bits_str.c_str(), &end, 10);
+    if (*end != '\0' || bits == 0 || bits > 32) {
+        fprintf(stderr, "Invalid bit depth: %s\n", bits_str.c_str());
+        return false;
+    }
+    fmt.bit_depth = static_cast<uint8_t>(bits);
+
+    unsigned long channels = strtoul(channels_str.c_str(), &end, 10);
+    if (*end != '\0' || channels == 0 || channels > 8) {
+        fprintf(stderr, "Invalid channel count: %s\n", channels_str.c_str());
+        return false;
+    }
+    fmt.channels = static_cast<uint8_t>(channels);
+
+    return true;
+}
+
+static bool parse_port(const char* str, uint16_t& port) {
+    char* end = nullptr;
+    unsigned long value = strtoul(str, &end, 10);
+    if (*str == '\0' || *end != '\0' || value == 0 || value > 65535UL) {
+        return false;
+    }
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
+static void print_usage(const char* prog) {
+    fprintf(stderr, "Usage: %s [options] [name]\n", prog);
+    fprintf(stderr, "  name          Friendly name (default: \"TUI Client\")\n\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
+    fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
+    fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
+    fprintf(stderr, "                Can be specified multiple times. Codecs: %s\n",
+            SUPPORTED_CODECS);
+    fprintf(stderr, "                At least one flac or pcm format is required\n");
+    fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
+    fprintf(stderr, "                pairing first\n");
+    fprintf(stderr, "  -F            The server cannot set the volume, which starts at full scale\n");
+    fprintf(stderr, "  -M            The server cannot set the mute state\n");
+    fprintf(stderr, "  -V            Disable visualizer\n");
+    fprintf(stderr, "  -h            Show this help\n");
+}
+
+int main(int argc, char* argv[]) {
+    // Parse command line options
+    bool enable_visualizer = true;
+    bool unpaired_access = false;
+    bool server_volume = true;
+    bool server_mute = true;
+    std::string connect_url;
+    uint16_t server_port = DEFAULT_SENDSPIN_PORT;
+    std::vector<sendspin::AudioSupportedFormatObject> audio_formats;
+    int opt;
+    while ((opt = getopt(argc, argv, "u:p:f:aFMVh")) != -1) {
+        switch (opt) {
+            case 'u':
+                connect_url = optarg;
+                break;
+            case 'p':
+                if (!parse_port(optarg, server_port)) {
+                    fprintf(stderr, "Invalid port: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                break;
+            case 'f': {
+                sendspin::AudioSupportedFormatObject fmt;
+                if (!parse_audio_format(optarg, fmt)) {
+                    return 1;
+                }
+                audio_formats.push_back(fmt);
+                break;
+            }
+            case 'a':
+                unpaired_access = true;
+                break;
+            case 'F':
+                server_volume = false;
+                break;
+            case 'M':
+                server_mute = false;
+                break;
+            case 'V':
+                enable_visualizer = false;
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+
+    // Suppress library logging since FTXUI owns the terminal
+    SendspinClient::set_log_level(LogLevel::NONE);
+
+    std::string friendly_name = (optind < argc) ? argv[optind] : "TUI Client";
+
+    // Configure the client
+    SendspinClientConfig config;
+    // client_id is derived from the static X25519 keypair; do not set it here.
+    config.name = friendly_name;
+    config.product_name = "sendspin-cpp host TUI";
+    config.manufacturer = "sendspin-cpp";
+    config.software_version = "0.1.0";
+    config.server_port = server_port;
+    // The TUI shows the pairing code in its pairing status line, so the client can advertise
+    // the dynamic_pairing_code method alongside the mandatory pairing_psk one. A text TUI
+    // cannot render a QR code, so only the digits format is offered.
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
+
+    // Create audio output
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+    PortAudioSink audio_sink;
+
+    // Validate explicitly requested formats against PortAudio device capabilities
+    if (!audio_formats.empty()) {
+        for (const auto& fmt : audio_formats) {
+            if (!PortAudioSink::is_format_supported(fmt.sample_rate, fmt.channels, fmt.bit_depth)) {
+                fprintf(stderr,
+                        "Audio format not supported by output device: %uHz %uch %ubit\n",
+                        fmt.sample_rate, fmt.channels, fmt.bit_depth);
+                return 1;
+            }
+        }
+    } else {
+        // Build default format list based on device capabilities
+        uint8_t max_ch = PortAudioSink::max_output_channels();
+        if (max_ch == 0) {
+            fprintf(stderr, "No audio output device available\n");
+            return 1;
+        }
+        uint8_t channels = std::min(max_ch, static_cast<uint8_t>(2));
+
+        static constexpr uint32_t SAMPLE_RATES[] = {44100, 48000, 88200, 96000};
+        static constexpr uint8_t BIT_DEPTHS[] = {16, 24, 32};
+        static constexpr SendspinCodecFormat CODECS[] = {
+            SendspinCodecFormat::FLAC,
+#ifdef SENDSPIN_ENABLE_OPUS
+            SendspinCodecFormat::OPUS,
+#endif
+            SendspinCodecFormat::PCM,
+        };
+
+        for (uint32_t rate : SAMPLE_RATES) {
+            for (uint8_t bits : BIT_DEPTHS) {
+                if (!PortAudioSink::is_format_supported(rate, channels, bits)) {
+                    continue;
+                }
+                for (SendspinCodecFormat codec : CODECS) {
+                    // Opus always decodes to 48kHz 16-bit
+                    if (codec == SendspinCodecFormat::OPUS && (rate != 48000 || bits != 16)) {
+                        continue;
+                    }
+                    audio_formats.push_back({codec, channels, rate, bits});
+                }
+            }
+        }
+
+        if (audio_formats.empty()) {
+            fprintf(stderr, "No supported audio formats found for default output device\n");
+            return 1;
+        }
+    }
+#elif defined(SENDSPIN_ENABLE_PLAYER)
+    if (audio_formats.empty()) {
+        audio_formats = {
+            {SendspinCodecFormat::FLAC, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 48000, 16},
+#ifdef SENDSPIN_ENABLE_OPUS
+            {SendspinCodecFormat::OPUS, 2, 48000, 16},
+#endif
+            {SendspinCodecFormat::PCM, 2, 44100, 16},
+            {SendspinCodecFormat::PCM, 2, 48000, 16},
+        };
+    }
+#endif
+
+    // Persist the static keypair (and pairing state) so client_id and pairing records survive
+    // restarts. Path: $HOME/.sendspin_tui.json (distinct from basic_client's
+    // .sendspin.json so the two examples do not share an identity/pairing file;
+    // regenerated if the file is absent).
+    const std::string persistence_path =
+        FilePersistenceProvider::default_path(".sendspin_tui.json");
+    FilePersistenceProvider persistence_provider(persistence_path);
+
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&persistence_provider);
+    client.set_unpaired_access_enabled(unpaired_access);
+
+    // Add roles
+#ifdef SENDSPIN_ENABLE_PLAYER
+    PlayerRoleConfig player_config;
+    player_config.audio_formats = std::move(audio_formats);
+    auto& player = client.add_player(std::move(player_config));
+    player.set_output_delay_adjustable(true);
+    player.set_volume_adjustable(server_volume);
+    player.set_mute_adjustable(server_mute);
+    if (!server_volume) {
+        player.update_volume(100);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // Added for its side effect: the client offers the role and accepts server/state for it.
+    (void)client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    auto& metadata = client.add_metadata();
+#endif
+
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    // Artwork channels: album art on channel 0, artist image on channel 1. The TUI reports what
+    // arrives rather than drawing it, so the sizes are the small ones a display of this kind asks
+    // for.
+    ArtworkRoleConfig artwork_config;
+    artwork_config.preferred_formats = {
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
+    };
+    // What each channel asked for, in channel order, for the Artwork panel to label its rows.
+    const std::vector<std::string> artwork_channel_labels = {
+        "album jpeg 320x320",
+        "artist png 64x64",
+    };
+    auto& artwork = client.add_artwork(std::move(artwork_config));
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    auto& color = client.add_color();
+#endif
+
+    // Visualizer support (disabled with -V flag)
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    VisualizerRole* vis_role = nullptr;
+    if (enable_visualizer) {
+        VisualizerSupportObject vis_support;
+        vis_support.buffer_capacity = 32768;
+        VisualizerStreamConfig vis_stream;
+        vis_stream.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                            VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                            VisualizerDataType::PEAK};
+        vis_stream.rate_max = 30;
+        vis_stream.spectrum = VisualizerSpectrumConfig{
+            .n_disp_bins = 32,
+            .scale = VisualizerSpectrumScale::MEL,
+            .f_min = 40,
+            .f_max = 16000,
+        };
+        // The UI redraws about every 30 ms, so a frame waits about 15 ms on average to be drawn.
+        vis_role = &client.add_visualizer(VisualizerRoleConfig{
+            .support = vis_support, .stream = vis_stream, .display_offset_ms = 15});
+    }
+#else
+    (void)enable_visualizer;
+#endif
+
+    // --- Listener implementations ---
+
+#ifdef SENDSPIN_ENABLE_PLAYER
+    struct TuiPlayerListener : PlayerRoleListener {
+        TuiState& state;
+        PlayerRole& player;
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+        PortAudioSink& sink;
+        TuiPlayerListener(TuiState& s, PlayerRole& p, PortAudioSink& a)
+            : state(s), player(p), sink(a) {}
+#else
+        TuiPlayerListener(TuiState& s, PlayerRole& p) : state(s), player(p) {}
+#endif
+
+        size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+            return sink.write(data, length, timeout_ms);
+#else
+            return null_audio_write(data, length, timeout_ms);
+#endif
+        }
+
+        void on_stream_start() override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                auto& params = player.get_current_stream_params();
+                state.codec = params.codec;
+                state.sample_rate = params.sample_rate;
+                state.bit_depth = params.bit_depth;
+                state.channels = params.channels;
+                state.streaming = true;
+            }
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+            auto& params = player.get_current_stream_params();
+            if (params.sample_rate.has_value() && params.channels.has_value() &&
+                params.bit_depth.has_value()) {
+                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
+            }
+#endif
+        }
+
+        void on_stream_end() override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.streaming = false;
+                state.codec = std::nullopt;
+                state.sample_rate = std::nullopt;
+                state.bit_depth = std::nullopt;
+                state.channels = std::nullopt;
+            }
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+            sink.clear();
+#endif
+        }
+
+        void on_volume_changed(uint8_t vol) override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.player_volume = vol;
+            }
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+            sink.set_volume(vol);
+#endif
+        }
+
+        void on_mute_changed(bool muted) override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.player_muted = muted;
+            }
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+            sink.set_muted(muted);
+#endif
+        }
+
+        void on_output_delay_changed(uint16_t delay) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.output_delay_ms = delay;
+        }
+    };
+#endif
+
+#ifdef SENDSPIN_ENABLE_METADATA
+    struct TuiMetadataListener : MetadataRoleListener {
+        TuiState& state;
+        explicit TuiMetadataListener(TuiState& s) : state(s) {}
+
+        void on_metadata(const ServerMetadataStateObject& md) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.title = md.title.value_or("");
+            state.artist = md.artist.value_or("");
+            state.album = md.album.value_or("");
+        }
+    };
+#endif
+
+    struct TuiClientListener : SendspinClientListener {
+        TuiState& state;
+        explicit TuiClientListener(TuiState& s) : state(s) {}
+
+        void on_group_update(const GroupUpdateObject& group) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (group.playback_state.has_value()) {
+                state.playback_state = *group.playback_state;
+            }
+            if (group.group_name.has_value()) {
+                state.group_name = *group.group_name;
+            }
+        }
+
+        void on_trust_changed(ConnectionTrust trust) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.trust = trust;
+        }
+
+        void on_pairing_started(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing...";
+        }
+
+        void on_pairing_succeeded(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Paired";
+        }
+
+        void on_pairing_failed(const std::string& /*server_id*/,
+                               SendspinPairAbortReason /*reason*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing failed";
+        }
+
+        void on_display_pairing_code(const std::string& code,
+                                     SendspinPairingCodeFormat format) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            // Only digits are offered above, so a code that arrives is six digits; pairing.md
+            // "Pairing Code Presentation" asks for the 3-3 grouping shown here, which is
+            // presentation only and never part of what the operator types.
+            state.pairing_status = format == SendspinPairingCodeFormat::DIGITS
+                                       ? "Code " + code.substr(0, 3) + "-" + code.substr(3)
+                                       : "Token " + code;
+        }
+
+        void on_clear_pairing_code() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.pairing_status.rfind("Code ", 0) == 0 ||
+                state.pairing_status.rfind("Token ", 0) == 0) {
+                state.pairing_status = "Pairing...";
+            }
+        }
+
+        void on_open_pairing_window() override {
+            // The tui_client example implements no pairing-window gesture, so an attempt held
+            // back by the round limit waits until the server cancels it.
+        }
+
+        void on_close_pairing_window() override {
+            // See on_open_pairing_window().
+        }
+    };
+
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    struct TuiArtworkListener : ArtworkRoleListener {
+        TuiState& state;
+        explicit TuiArtworkListener(TuiState& s) : state(s) {}
+
+        // Fires on the decode thread. A TUI has nothing to decode the image into.
+        void on_image_decode(uint8_t slot, const uint8_t* /*data*/, size_t length,
+                             SendspinImageFormat /*format*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = length;
+                ++state.artwork_channels[slot].images;
+            }
+        }
+
+        void on_image_clear(uint8_t slot) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = 0;
+            }
+        }
+    };
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    struct TuiColorListener : ColorRoleListener {
+        TuiState& state;
+        explicit TuiColorListener(TuiState& s) : state(s) {}
+
+        void on_color(const ServerColorStateObject& palette) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = true;
+            state.color_primary = palette.primary;
+            state.color_accent = palette.accent;
+            state.color_background_dark = palette.background_dark;
+        }
+
+        void on_color_clear() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = false;
+            state.color_primary.reset();
+            state.color_accent.reset();
+            state.color_background_dark.reset();
+        }
+    };
+#endif
+
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    struct TuiVisualizerListener : VisualizerRoleListener {
+        TuiState& state;
+        explicit TuiVisualizerListener(TuiState& s) : state(s) {}
+
+        void on_visualizer_stream_start(const ServerVisualizerStreamObject& vis_stream) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.visualizer_active = true;
+            if (vis_stream.spectrum.has_value()) {
+                state.vis_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0);
+                state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
+            }
+            state.vis_display_loudness = 0.0f;
+        }
+
+        void on_visualizer_stream_end() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.visualizer_active = false;
+            state.vis_loudness = 0;
+            state.vis_peak_freq = 0;
+            std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
+            std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
+            state.vis_display_loudness = 0.0f;
+            state.vis_beat = false;
+            state.vis_peak = false;
+        }
+
+        void on_visualizer_stream_clear() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_loudness = 0;
+            state.vis_peak_freq = 0;
+            std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
+            std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
+            state.vis_display_loudness = 0.0f;
+            state.vis_beat = false;
+            state.vis_peak = false;
+        }
+
+        void on_loudness(int64_t /*client_timestamp*/, uint16_t loudness) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_loudness = loudness;
+        }
+
+        void on_f_peak(int64_t /*client_timestamp*/, uint16_t frequency_hz,
+                       uint16_t /*amplitude*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_peak_freq = frequency_hz;
+        }
+
+        void on_spectrum(int64_t /*client_timestamp*/,
+                         const std::vector<uint16_t>& bins) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_spectrum = bins;
+        }
+
+        void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            int64_t current_us = SendspinClient::now_us();
+            state.vis_beat = true;
+            state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
+        }
+
+        void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            int64_t current_us = SendspinClient::now_us();
+            state.vis_peak = true;
+            state.vis_peak_expire_us = current_us + 100000;  // 100ms flash
+        }
+    };
+#endif
+
+    struct HostNetworkProvider : SendspinNetworkProvider {
+        bool is_network_ready() override { return true; }
+    };
+
+    // Shared TUI state
+    TuiState state;
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    for (const auto& label : artwork_channel_labels) {
+        state.artwork_channels.push_back({label, 0, 0});
+    }
+#endif
+
+    // Create and wire listeners
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+    TuiPlayerListener player_listener(state, player, audio_sink);
+    audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
+        player.notify_audio_played(frames, timestamp);
+    };
+#elif defined(SENDSPIN_ENABLE_PLAYER)
+    TuiPlayerListener player_listener(state, player);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    TuiMetadataListener metadata_listener(state);
+#endif
+    TuiClientListener client_listener(state);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    TuiArtworkListener artwork_listener(state);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    TuiColorListener color_listener(state);
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    TuiVisualizerListener visualizer_listener(state);
+#endif
+    HostNetworkProvider network_provider;
+
+#ifdef SENDSPIN_ENABLE_PLAYER
+    player.set_listener(&player_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    metadata.set_listener(&metadata_listener);
+#endif
+    client.set_listener(&client_listener);
+    client.set_network_provider(&network_provider);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    artwork.set_listener(&artwork_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    color.set_listener(&color_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (vis_role) {
+        vis_role->set_listener(&visualizer_listener);
+    }
+#endif
+
+    // Start the server
+    if (!client.start()) {
+        fprintf(stderr, "Failed to start server\n");
+        return 1;
+    }
+
+    // Expose client_id in the TUI state for display.
+    // client_id is base64url(static X25519 public key), 43 chars.
+    //
+    // Also expose the formatted Pairing PSK token: a server that only offers the mandatory
+    // pairing_psk method (dynamic_pairing_code is optional) needs this pasted in by the operator,
+    // so without showing it here a user could not pair against such a server at all. The same
+    // thing basic_client prints in its startup banner, routed into TUI state instead of stderr
+    // since the TUI owns the terminal.
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.client_id = client.client_id();
+        auto token = client.pairing_token();
+        if (token.has_value()) {
+            state.pairing_token = std::move(*token);
+        }
+    }
+
+    // Advertise via mDNS and browse for other servers (when compiled in)
+#ifdef SENDSPIN_HAS_MDNS
+    MdnsAdvertiser mdns;
+    mdns.start(friendly_name, server_port, SENDSPIN_PATH);
+
+    MdnsBrowser mdns_browser;
+    mdns_browser.start();
+#endif
+
+    // Auto-connect if a URL was provided via -u
+    if (!connect_url.empty()) {
+        // Parse host and port from ws://host:port/path for display
+        {
+            std::string url_tmp = connect_url;
+            auto scheme_end = url_tmp.find("://");
+            if (scheme_end != std::string::npos) {
+                url_tmp = url_tmp.substr(scheme_end + 3);
+            }
+            auto path_start = url_tmp.find('/');
+            std::string host_port = (path_start != std::string::npos)
+                                        ? url_tmp.substr(0, path_start)
+                                        : url_tmp;
+            auto colon = host_port.rfind(':');
+            if (colon != std::string::npos) {
+                state.connected_host = host_port.substr(0, colon);
+                state.connected_port =
+                    static_cast<uint16_t>(std::stoul(host_port.substr(colon + 1)));
+            } else {
+                state.connected_host = host_port;
+                state.connected_port = DEFAULT_SENDSPIN_PORT;
+            }
+        }
+        client.connect_to(connect_url);
+    }
+
+    // Create FTXUI screen and component
+    auto screen = ftxui::ScreenInteractive::Fullscreen();
+    auto component = create_tui_component(client, state, screen);
+
+    // Background thread: drives client protocol and posts UI refresh events
+    std::atomic<bool> running{true};
+    std::thread client_thread([&] {
+        int tick = 0;
+        int vis_refresh_counter = 0;
+        while (running.load()) {
+            // The key handler runs on the FTXUI thread and cannot call the main-loop-only
+            // PlayerRole setters itself, so it queues them here instead.
+            apply_pending_player_commands(state, client);
+            client.loop();
+
+            bool vis_showing;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                vis_showing = state.show_visualizer;
+            }
+
+            // Smooth visualizer display values every tick (10ms), only when visible
+            if (vis_showing) {
+                int64_t current_us = SendspinClient::now_us();
+                std::lock_guard<std::mutex> lock(state.mutex);
+
+                // Smooth decay: display values chase target values each tick.
+                // Rise fast (attack ~30ms), fall slow (decay ~200ms).
+                // At 10ms ticks: attack_alpha ~0.33, decay_alpha ~0.05
+                constexpr float ATTACK_ALPHA = 0.33f;
+                constexpr float DECAY_ALPHA = 0.05f;
+                constexpr float LOUDNESS_MAX = 65535.0f;
+
+                // Ensure display vectors are sized
+                if (state.vis_display_spectrum.size() != state.vis_spectrum.size()) {
+                    state.vis_display_spectrum.resize(state.vis_spectrum.size(), 0.0f);
+                }
+
+                // Find max for normalization (floor at 8192 to avoid over-amplification)
+                uint16_t max_val = 1;
+                for (auto v : state.vis_spectrum) {
+                    if (v > max_val) max_val = v;
+                }
+                if (max_val < 8192) max_val = 8192;
+                float norm = 1.0f / static_cast<float>(max_val);
+
+                for (size_t i = 0; i < state.vis_spectrum.size(); ++i) {
+                    float target = static_cast<float>(state.vis_spectrum[i]) * norm;
+                    float current = state.vis_display_spectrum[i];
+                    float alpha = (target > current) ? ATTACK_ALPHA : DECAY_ALPHA;
+                    state.vis_display_spectrum[i] = current + alpha * (target - current);
+                }
+
+                // Smooth loudness
+                {
+                    float target = static_cast<float>(state.vis_loudness) / LOUDNESS_MAX;
+                    float current = state.vis_display_loudness;
+                    float alpha = (target > current) ? ATTACK_ALPHA : DECAY_ALPHA;
+                    state.vis_display_loudness = current + alpha * (target - current);
+                }
+
+                // Expire beat and peak flashes
+                if (state.vis_beat && current_us >= state.vis_beat_expire_us) {
+                    state.vis_beat = false;
+                }
+                if (state.vis_peak && current_us >= state.vis_peak_expire_us) {
+                    state.vis_peak = false;
+                }
+            }
+
+            // Post UI refresh at ~30fps (every 3 ticks) when visualizer is showing
+            // cppcheck-suppress duplicateCondition
+            // Deliberate: an independent guard for a second, unrelated purpose (smoothing above
+            // vs. refresh throttling here), not a leftover duplicate of the same check.
+            if (vis_showing) {
+                if (++vis_refresh_counter % 3 == 0) {
+                    screen.PostEvent(ftxui::Event::Custom);
+                }
+            }
+
+            if (++tick % 25 == 0) {  // every 250ms
+                // Snapshot previous state to detect changes
+                uint32_t prev_progress, prev_duration;
+                bool prev_connected;
+                uint8_t prev_group_vol, prev_player_vol;
+                bool prev_group_muted, prev_player_muted;
+                std::string prev_group_name;
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    prev_progress = state.track_progress_ms;
+                    prev_duration = state.track_duration_ms;
+                    prev_connected = state.connected;
+                    prev_group_vol = state.group_volume;
+                    prev_player_vol = state.player_volume;
+                    prev_group_muted = state.group_muted;
+                    prev_player_muted = state.player_muted;
+                    prev_group_name = state.group_name;
+                }
+
+                update_polled_state(state, client);
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
+                // Sync audio sink volume with client state every poll cycle.
+                // This catches all volume sources: key presses (update_volume),
+                // server commands (on_volume_changed), and polling updates.
+                audio_sink.set_volume(player.get_volume());
+                audio_sink.set_muted(player.get_muted());
+#endif
+                // Update discovered servers list
+#ifdef SENDSPIN_HAS_MDNS
+                {
+                    auto servers = mdns_browser.get_servers();
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.discovered_servers = std::move(servers);
+                    // Clamp selector index to valid range
+                    int max_index = static_cast<int>(state.discovered_servers.size()) - 1;
+                    if (state.server_selector_index > max_index) {
+                        state.server_selector_index = std::max(0, max_index);
+                    }
+                }
+#endif
+
+                // Only post a redraw if something actually changed
+                if (!vis_showing) {
+                    bool changed;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        changed = (state.track_progress_ms != prev_progress ||
+                                   state.track_duration_ms != prev_duration ||
+                                   state.connected != prev_connected ||
+                                   state.group_volume != prev_group_vol ||
+                                   state.player_volume != prev_player_vol ||
+                                   state.group_muted != prev_group_muted ||
+                                   state.player_muted != prev_player_muted ||
+                                   state.group_name != prev_group_name);
+                    }
+                    if (changed) {
+                        screen.PostEvent(ftxui::Event::Custom);
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    // Run the TUI event loop (blocks until quit)
+    screen.Loop(component);
+
+    // Cleanup
+    running.store(false);
+    client_thread.join();
+#ifdef SENDSPIN_HAS_MDNS
+    mdns_browser.stop();
+    mdns.stop();
+#endif
+    client.stop();
+
+    return 0;
+}

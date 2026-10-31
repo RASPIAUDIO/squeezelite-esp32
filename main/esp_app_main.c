@@ -13,12 +13,14 @@
 #include "led.h"
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 #include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "freertos/task.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
+#include "esp_mac.h"
+#include "esp_partition.h"
 #include "esp_wifi.h"
 #include <esp_event.h>
 #include "nvs_flash.h"
@@ -108,6 +110,8 @@ const DefaultStringVal defaultStringVals[] = {
     {"telnet_buffer", "40000"},
     {"telnet_block", "500"},
     {"stats", "n"},
+    {"wifi_setup", "Y"},
+    {"improv_serial", "Y"},
     {"rel_api", CONFIG_RELEASE_API},
     {"pollmx", "600"},
     {"pollmin", "15"},
@@ -128,7 +132,10 @@ const DefaultStringVal defaultStringVals[] = {
 #endif	
 #ifdef CONFIG_AIRPLAY_SINK
 	{"airplay_port", CONFIG_AIRPLAY_PORT},
-	{"enable_airplay", STR(CONFIG_AIRPLAY_SINK)}
+	{"enable_airplay", STR(CONFIG_AIRPLAY_SINK)},
+#if CONFIG_IDF_TARGET_ESP32S31
+    {"airplay2", "1"},
+#endif
 #endif	
 };
 static bool bNetworkConnected=false;
@@ -148,7 +155,7 @@ bool is_network_connected(){
 void cb_connection_got_ip(nm_state_t new_state, int sub_state){
 	const char *hostname;
 	static ip4_addr_t ip;
-	tcpip_adapter_ip_info_t ipInfo; 
+	esp_netif_ip_info_t ipInfo; 
 	network_get_ip_info(&ipInfo);
 	if (ip.addr && ipInfo.ip.addr != ip.addr) {
 		ESP_LOGW(TAG, "IP change, need to reboot");

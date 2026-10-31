@@ -10,6 +10,7 @@
 #include "esp_system.h"
 #include "platform_config.h"
 #include "audio_controls.h"
+#include "audio_source.h"
 #include "display.h"
 #include "accessors.h"
 #include "network_services.h"
@@ -18,9 +19,9 @@
 #include "cspot_private.h"
 #include "cspot_sink.h"
 
-char EXT_RAM_ATTR deviceId[16];
+char EXT_RAM_BSS_ATTR deviceId[16];
 
-static EXT_RAM_ATTR struct cspot_cb_s {
+static EXT_RAM_BSS_ATTR struct cspot_cb_s {
 	cspot_cmd_vcb_t cmd;
 	cspot_data_cb_t data;
 } cspot_cbs;
@@ -95,7 +96,9 @@ const static actrls_t controls = {
 void got_artwork(uint8_t* data, size_t len, void *context) {
 	if (data) {
 		ESP_LOGI(TAG, "got artwork of %zu bytes", len);
-		displayer_artwork(data);
+        audio_source_lock();
+        if ((uintptr_t)context == audio_source_generation()) displayer_artwork(data);
+        audio_source_unlock();
 		free(data);
 	} else {
 		ESP_LOGW(TAG, "artwork error or too large %zu", len);
@@ -109,9 +112,11 @@ static bool cmd_handler(cspot_event_t event, ...) {
 	va_list args;	
 
 	va_start(args, event);
+	audio_source_lock();
 	
 	// handle audio event and stop if forbidden
 	if (!cmd_handler_chain(event, args)) {
+		audio_source_unlock();
 		va_end(args);
 		return false;
 	}
@@ -140,7 +145,7 @@ static bool cmd_handler(cspot_event_t event, ...) {
 		char *artist = va_arg(args, char*), *album = va_arg(args, char*), *title = va_arg(args, char*), *artwork = va_arg(args, char*);
 		if (artwork && displayer_can_artwork()) {
 			ESP_LOGI(TAG, "requesting artwork %s", artwork);
-			http_download(artwork, 128*1024, got_artwork, NULL);
+			http_download(artwork, 128*1024, got_artwork, (void *)(uintptr_t)audio_source_generation());
 		}	
 		displayer_metadata(artist, album, title);
 		displayer_timer(DISPLAYER_ELAPSED, offset, duration);
@@ -152,6 +157,7 @@ static bool cmd_handler(cspot_event_t event, ...) {
 	}
 	
 	va_end(args);
+	audio_source_unlock();
 	
 	return true;
 }

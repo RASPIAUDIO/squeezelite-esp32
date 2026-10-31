@@ -111,7 +111,7 @@ static void initialise_wifi(void)
 	led_blink(LED_GREEN, 250, 250);
 }
 
-static void wifi_join(void *arg)
+static void wifi_join(TimerHandle_t xTimer)
 {
 	const char *ssid = join_args.ssid->sval[0];
     const char *pass = join_args.password->sval[0];
@@ -127,7 +127,7 @@ static void wifi_join(void *arg)
     }
 
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK( esp_wifi_connect() );
 
     int bits = xEventGroupWaitBits(network_event_group, CONNECTED_BIT,
@@ -202,8 +202,67 @@ void register_wifi_join()
     ESP_ERROR_CHECK( esp_console_cmd_register(&join_cmd) );
 }
 
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "network_wifi.h"
+
+/* Read the negotiated PHY, not merely the AP's advertised capabilities. */
+static int wifi_diag(int argc, char **argv)
+{
+    wifi_ap_record_t ap = {0};
+    wifi_phy_mode_t phy;
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err != ESP_OK) {
+        printf("WiFi station: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("WiFi station SSID=%.*s channel=%u RSSI=%d AP_ax=%u\n",
+           32, (char *)ap.ssid, ap.primary, ap.rssi, ap.phy_11ax);
+    err = esp_wifi_sta_get_negotiated_phymode(&phy);
+    if (err != ESP_OK) {
+        printf("Negotiated PHY unavailable: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    const char *names[] = {"LR", "802.11b", "802.11g", "802.11a",
+                           "802.11n HT20", "802.11n HT40", "802.11ax HE20", "802.11ac VHT20"};
+    printf("Negotiated PHY=%s (%d)\n",
+           (unsigned)phy < sizeof(names)/sizeof(names[0]) ? names[phy] : "unknown", phy);
+    esp_netif_ip_info_t ip;
+    esp_netif_t *netif = network_wifi_get_interface();
+    if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK)
+        printf("WiFi IPv4=" IPSTR " gateway=" IPSTR "\n", IP2STR(&ip.ip), IP2STR(&ip.gw));
+    return 0;
+}
+
+static int wifi_join_managed(int argc, char **argv)
+{
+    if (argc != 3 || strlen(argv[1]) == 0 || strlen(argv[1]) > 32 || strlen(argv[2]) > 63) {
+        printf("Usage: wifi_join <ssid> <password>\n");
+        return 1;
+    }
+    if (!is_wifi_up()) {
+        printf("Start in WiFi mode before joining.\n");
+        return 1;
+    }
+    network_async_connect(argv[1], argv[2]);
+    printf("WiFi connection queued; use wifi_diag after DHCP.\n");
+    return 0;
+}
+#endif
+
 void register_wifi()
 {
+#if CONFIG_IDF_TARGET_ESP32S31
+    const esp_console_cmd_t diag = {
+        .command = "wifi_diag", .help = "Show WiFi station channel, RSSI and negotiated PHY",
+        .func = wifi_diag,
+    };
+    const esp_console_cmd_t join = {
+        .command = "wifi_join", .help = "Join WiFi through the network manager; console input is echoed",
+        .func = wifi_join_managed,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&diag));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&join));
+#endif
  #ifdef WIFI_CMDLINE
     register_wifi_join();
     if(bypass_network_manager){

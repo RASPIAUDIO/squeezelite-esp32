@@ -755,6 +755,9 @@ void _pa_open(void);
 // output_embedded.c
 #if EMBEDDED
 void set_volume(unsigned left, unsigned right);
+#if CONFIG_MNCAST_SENDSPIN
+bool set_volume_owned(int source, unsigned left, unsigned right);
+#endif
 bool test_open(const char *device, unsigned rates[], bool userdef_rates);
 void output_init_embedded(log_level level, char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle);
 void output_close_embedded(void);

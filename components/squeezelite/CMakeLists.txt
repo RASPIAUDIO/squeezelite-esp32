@@ -1,16 +1,18 @@
 # for the forgetful, REQUIRES cannot use CONFIG_XXX due to parsing order
-if(IDF_TARGET STREQUAL "esp32")
+if(IDF_TARGET STREQUAL "esp32" OR IDF_TARGET STREQUAL "esp32s31")
     set(target_requires "driver_bt")
+endif()
+if(IDF_TARGET STREQUAL "esp32s31")
+    list(APPEND target_requires espressif__esp_codec_dev sendspin_sink airplay2)
 endif()
 
 idf_component_register( SRC_DIRS . external ac101 tas57xx wm8978
 						INCLUDE_DIRS .  ac101 
-						PRIV_REQUIRES 	
-									codecs
-									newlib 
+						REQUIRES driver codecs
+									esp_libc 
 									esp_common 
 									esp-dsp
-						  			platform_config 
+						  		platform_config 
 						 			services 
 									spotify
 						 			raop   
@@ -19,6 +21,7 @@ idf_component_register( SRC_DIRS . external ac101 tas57xx wm8978
 						 			audio
 									led_strip
 									_override
+									esp_timer
 						 			${target_requires}                                    
 						EMBED_FILES vu_s.data arrow.data
 )
@@ -37,8 +40,15 @@ add_definitions(-DLINKALL -DLOOPBACK -DNO_FAAD -DEMBEDDED -DTREMOR_ONLY -DCUSTOM
 
 if (${DEPTH} EQUAL "32")
 	add_definitions(-DBYTES_PER_FRAME=8)
+    if(IDF_TARGET STREQUAL "esp32s31")
+        add_definitions(-DRESAMPLE)
+    endif()
 else()	
-	add_definitions(-DRESAMPLE16 -DBYTES_PER_FRAME=4)
+	if(IDF_TARGET STREQUAL "esp32s31")
+        add_definitions(-DRESAMPLE -DBYTES_PER_FRAME=4)
+    else()
+        add_definitions(-DRESAMPLE16 -DBYTES_PER_FRAME=4)
+    endif()
 endif()	
 
 if (NOT DEFINED AAC_DISABLED_SBR)

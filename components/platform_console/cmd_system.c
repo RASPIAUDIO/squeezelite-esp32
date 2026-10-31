@@ -13,14 +13,20 @@
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
+#include "esp_chip_info.h"
+#include "spi_flash_mmap.h"
+#include "esp_flash.h"
 #include "driver/rtc_io.h"
 #include "driver/uart.h"
 #include "argtable3/argtable3.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "soc/rtc_cntl_reg.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 6
+#include "esp_rom_serial_output.h"
+#else
 #include "esp_rom_uart.h"
+#endif
 #include "cmd_system.h"
 #include "sdkconfig.h"
 #include "esp_partition.h"
@@ -31,6 +37,9 @@
 #include "messaging.h"				  
 #include "platform_console.h"
 #include "tools.h"
+#if CONFIG_HEAP_TRACING_STANDALONE && CONFIG_IDF_TARGET_ESP32S31
+#include "esp_heap_trace.h"
+#endif
 
 #ifdef CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
 #pragma message("Runtime stats enabled")
@@ -38,16 +47,19 @@
 #else 
 #pragma message("Runtime stats disabled")
 #endif
-EXT_RAM_ATTR static struct {
+EXT_RAM_BSS_ATTR static struct {
 	struct arg_str *name;
 	struct arg_end *end;
 } name_args;
-EXT_RAM_ATTR static struct {
+EXT_RAM_BSS_ATTR static struct {
     #if CONFIG_CSPOT_SINK	
     struct arg_lit *cspot;
     #endif     
  	struct arg_lit *btspeaker;
  	struct arg_lit *airplay;
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_AIRPLAY_SINK
+    struct arg_lit *airplay2;
+#endif
  	struct arg_str *telnet;
 
 #if WITH_TASKS_INFO    
@@ -61,6 +73,9 @@ static const char * TAG = "cmd_system";
 static void register_free();
 static void register_setdevicename();
 static void register_heap();
+#if CONFIG_HEAP_TRACING_STANDALONE && CONFIG_IDF_TARGET_ESP32S31
+static void register_heaptrace();
+#endif
 static void register_dump_heap();
 static void register_abort();
 static void register_version();
@@ -72,6 +87,8 @@ static void register_light_sleep();
 static void register_factory_boot();
 static void register_restart_ota();
 static void register_set_services();
+static void register_wifi_setup();
+static void register_improv_serial();
 #if WITH_TASKS_INFO
 static void register_tasks();
 #endif
@@ -88,8 +105,13 @@ void register_system()
 
     register_setdevicename();
     register_set_services();
+    register_wifi_setup();
+    register_improv_serial();
     register_free();
     register_heap();
+#if CONFIG_HEAP_TRACING_STANDALONE && CONFIG_IDF_TARGET_ESP32S31
+    register_heaptrace();
+#endif
     register_dump_heap();
     register_abort();
     register_version();
@@ -118,6 +140,8 @@ static int get_version(int argc, char **argv)
 {
     esp_chip_info_t info;
     esp_chip_info(&info);
+    uint32_t flash_size;
+    esp_flash_get_size(NULL, &flash_size);
     cmd_send_messaging(argv[0],MESSAGING_INFO,
     "IDF Version:%s\r\n"
     "Chip info:\r\n"
@@ -130,7 +154,7 @@ static int get_version(int argc, char **argv)
 		info.features & CHIP_FEATURE_BLE ? "/BLE" : "",
 		info.features & CHIP_FEATURE_BT ? "/BT" : "",
 		info.features & CHIP_FEATURE_EMB_FLASH ? "/Embedded-Flash:" : "/External-Flash:",
-		spi_flash_get_chip_size() / (1024 * 1024), " MB", info.revision);
+		flash_size / (1024 * 1024), " MB", info.revision);
     return 0;
 }
 
@@ -312,6 +336,12 @@ static int dump_heap(int argc, char **argv)
 {
     ESP_LOGD(TAG, "Dumping heap");
     heap_caps_dump_all();
+    return 0;
+}
+/* Region minima explain pools added after startup; never dump heap contents. */
+static int heap_regions(int argc, char **argv)
+{
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     return 0;
 }
 /* 'heap' command prints minumum heap size */
@@ -497,6 +527,51 @@ static int setdevicename(int argc, char **argv)
 
 }
 
+#if CONFIG_HEAP_TRACING_STANDALONE && CONFIG_IDF_TARGET_ESP32S31
+/* Diagnostic builds only. External storage avoids consuming audio DMA RAM.
+ * IDF does not record ISR allocations with an external trace buffer. */
+static heap_trace_record_t *trace_records;
+static int heaptrace_command(int argc, char **argv)
+{
+    if (argc != 2) return ESP_ERR_INVALID_ARG;
+    if (!strcmp(argv[1], "start")) {
+        if (!trace_records) {
+            trace_records = heap_caps_calloc(2048, sizeof(*trace_records),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!trace_records) return ESP_ERR_NO_MEM;
+            esp_err_t err = heap_trace_init_standalone(trace_records, 2048);
+            if (err != ESP_OK) {
+                free(trace_records);
+                trace_records = NULL;
+                return err;
+            }
+        }
+        return heap_trace_start(HEAP_TRACE_LEAKS);
+    }
+    if (!strcmp(argv[1], "stop")) {
+        esp_err_t err = heap_trace_stop();
+        if (err != ESP_OK) return err;
+        heap_trace_summary_t summary;
+        err = heap_trace_summary(&summary);
+        if (err != ESP_OK) return err;
+        printf("HEAPTRACE count=%zu capacity=%zu peak=%zu overflow=%zu allocations=%zu frees=%zu\n",
+               summary.count, summary.capacity, summary.high_water_mark,
+               summary.has_overflowed, summary.total_allocations, summary.total_frees);
+        heap_trace_dump_caps(MALLOC_CAP_SPIRAM);
+        return ESP_OK;
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+static void register_heaptrace()
+{
+    const esp_console_cmd_t command = {
+        .command = "heaptrace", .help = "Diagnostic task allocations: start | stop",
+        .func = heaptrace_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&command));
+}
+#endif
+
 static void register_heap()
 {
     const esp_console_cmd_t heap_cmd = {
@@ -514,6 +589,12 @@ static void register_heap()
 
 static void register_dump_heap()
 {
+    const esp_console_cmd_t regions_cmd = {
+        .command = "heap_regions",
+        .help = "Print internal DMA region sizes and historical minima to serial",
+        .func = &heap_regions,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&regions_cmd));
     const esp_console_cmd_t heap_cmd = {
         .command = "dump_heap",
         .help = "Dumps the content of the heap to serial output",
@@ -671,6 +752,9 @@ static int do_set_services(int argc, char **argv)
 	}
 
 	nerrors += enable_disable(f,"enable_airplay",set_services_args.airplay);
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_AIRPLAY_SINK
+    nerrors += enable_disable(f,"airplay2",set_services_args.airplay2);
+#endif
 	nerrors += enable_disable(f,"enable_bt_sink",set_services_args.btspeaker);
     #if CONFIG_CSPOT_SINK	
     nerrors += enable_disable(f,"enable_cspot",set_services_args.cspot);
@@ -715,6 +799,9 @@ cJSON * set_services_cb(){
 	char * p=NULL;
     console_set_bool_parameter(values,"enable_bt_sink",set_services_args.btspeaker);
     console_set_bool_parameter(values,"enable_airplay",set_services_args.airplay);
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_AIRPLAY_SINK
+    console_set_bool_parameter(values,"airplay2",set_services_args.airplay2);
+#endif
     #if CONFIG_CSPOT_SINK	
     console_set_bool_parameter(values,"enable_cspot",set_services_args.cspot);
     #endif
@@ -737,8 +824,60 @@ cJSON * set_services_cb(){
 	return values;
 }
 
+static struct {struct arg_lit *enabled; struct arg_end *end;} improv_args;
+static int do_improv_serial(int argc,char **argv) {
+    if(arg_parse_msg(argc,argv,(struct arg_hdr **)&improv_args)) return 1;
+    esp_err_t err=config_set_value(NVS_TYPE_STR,"improv_serial",improv_args.enabled->count ? "Y":"N");
+    cmd_send_messaging(argv[0],err==ESP_OK ? MESSAGING_INFO:MESSAGING_ERROR,
+        err==ESP_OK ? "USB Wi-Fi setup setting saved.":"Could not save USB Wi-Fi setup setting.");
+    return err;
+}
+static cJSON *improv_serial_cb(void) {
+    cJSON *v=cJSON_CreateObject();
+    console_set_bool_parameter(v,"improv_serial",improv_args.enabled);return v;
+}
+static void register_improv_serial(void) {
+    improv_args.enabled=arg_lit0(NULL,"enable","Enable Improv Serial Wi-Fi setup over USB");
+    improv_args.end=arg_end(1);
+    const esp_console_cmd_t cmd={.command=CFG_TYPE_SYST("improv"),
+        .help="USB Wi-Fi setup (Improv Serial)",.func=do_improv_serial,.argtable=&improv_args};
+    cmd_to_json_with_cb(&cmd,&improv_serial_cb);
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+static struct {
+    struct arg_lit *enabled;
+    struct arg_end *end;
+} wifi_setup_args;
+
+static int do_wifi_setup(int argc, char **argv) {
+    if (arg_parse_msg(argc,argv,(struct arg_hdr **)&wifi_setup_args)) return 1;
+    esp_err_t err = config_set_value(NVS_TYPE_STR,"wifi_setup",wifi_setup_args.enabled->count ? "Y" : "N");
+    cmd_send_messaging(argv[0],err == ESP_OK ? MESSAGING_INFO : MESSAGING_ERROR,
+        err == ESP_OK ? "Saved. Apply or reboot to update Wi-Fi setup QR and captive portal." : "Could not save Wi-Fi setup option.");
+    return err;
+}
+static cJSON *wifi_setup_cb(void) {
+    cJSON *values = cJSON_CreateObject();
+    console_set_bool_parameter(values,"wifi_setup",wifi_setup_args.enabled);
+    return values;
+}
+static void register_wifi_setup(void) {
+    wifi_setup_args.enabled=arg_lit0(NULL,"enable","Enable Wi-Fi setup QR and captive portal");
+    wifi_setup_args.end=arg_end(1);
+    const esp_console_cmd_t cmd = {
+        .command=CFG_TYPE_SYST("wifi-setup"),
+        .help="Wi-Fi setup (when offline; Apply restarts the device)",
+        .func=do_wifi_setup, .argtable=&wifi_setup_args,
+    };
+    cmd_to_json_with_cb(&cmd,&wifi_setup_cb);
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static void register_set_services(){
 	set_services_args.airplay = arg_lit0(NULL, "AirPlay", "AirPlay");
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_AIRPLAY_SINK
+    set_services_args.airplay2 = arg_lit0(NULL, "AirPlay2", "Enable AirPlay 2 (unchecked: AirPlay 1)");
+#endif
     #if CONFIG_CSPOT_SINK	
     set_services_args.cspot = arg_lit0(NULL, "cspot", "Spotify (cspot)");
     #endif

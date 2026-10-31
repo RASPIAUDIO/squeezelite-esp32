@@ -1,0 +1,18 @@
+menu "MnCast Sendspin integration"
+    config MNCAST_SENDSPIN
+        bool "Build native Sendspin receiver"
+        depends on IDF_TARGET_ESP32S31
+        select WS_TRANSPORT
+        default y
+        help
+            Runtime activation additionally requires enable_sendspin=y in NVS.
+    config MNCAST_SENDSPIN_EXPERIMENTAL_HIRES
+        bool "Advertise experimental 96/192 kHz FLAC over Sendspin"
+        depends on MNCAST_SENDSPIN
+        default n
+        help
+            Default Sendspin formats are stereo PCM/FLAC at 44.1/48 kHz,
+            16/24 bits. High-rate FLAC has only short reference-server tests;
+            music endurance and Music Assistant remain unverified. Raw PCM
+            above 48 kHz is not advertised. Does not limit LMS playback rates.
+endmenu

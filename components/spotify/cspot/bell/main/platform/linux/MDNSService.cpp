@@ -3,10 +3,10 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <atomic>
 #include <cstring>
-#include <mutex>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 #if __has_include("avahi-client/client.h")
 #include <avahi-client/client.h>
@@ -44,9 +44,7 @@ class implMDNSService : public MDNSService {
   static in_addr_t host;
   static std::atomic<size_t> instances;
 
-  implMDNSService(struct mdns_service* service) : service(service) {
-    instances++;
-  };
+  implMDNSService(struct mdns_service* service) : service(service){ instances++; };
 #ifndef BELL_DISABLE_AVAHI
   implMDNSService(AvahiEntryGroup* avahiGroup) : avahiGroup(avahiGroup){};
 #endif
@@ -82,10 +80,10 @@ void implMDNSService::unregisterService() {
   {
     mdns_service_remove(implMDNSService::mdnsServer, service);
     if (!--instances && implMDNSService::mdnsServer) {
-      mdnsd_stop(implMDNSService::mdnsServer);
-      implMDNSService::mdnsServer = nullptr;
+     mdnsd_stop(implMDNSService::mdnsServer);
+     implMDNSService::mdnsServer = nullptr;
     }
-  }
+  }  
 }
 
 std::unique_ptr<MDNSService> MDNSService::registerService(
@@ -197,10 +195,9 @@ std::unique_ptr<MDNSService> MDNSService::registerService(
     BELL_LOG(info, "MDNS", "using built-in mDNS for %s", serviceName.c_str());
     auto service =
         mdnsd_register_svc(implMDNSService::mdnsServer, serviceName.c_str(),
-                           type.c_str(), servicePort, NULL, txt.data());
+                             type.c_str(), servicePort, NULL, txt.data());
 
-    if (service)
-      return std::make_unique<implMDNSService>(service);
+    if (service) return std::make_unique<implMDNSService>(service);
   }
 
   BELL_LOG(error, "MDNS", "cannot start any mDNS listener for %s",

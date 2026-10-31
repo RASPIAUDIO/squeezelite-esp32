@@ -11,8 +11,7 @@
  
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <driver/i2s.h>
-#include "driver/i2c.h"
+#include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "gpio_exp.h"
 #include "cJSON.h"
@@ -25,11 +24,11 @@ static void speaker(bool active);
 static void headset(bool active);
 static bool volume(unsigned left, unsigned right) { return false; }
 static void power(adac_power_e mode);
-static bool init(char *config, int i2c_port_num, i2s_config_t *i2s_config, bool *mck);
+static bool init(char *config, int i2c_port_num, i2s_config_param_t *i2s_config, bool *mck);
 
 static bool i2c_json_execute(char *set);
 
-const struct adac_s dac_external = { "i2s", init, adac_deinit, power, speaker, headset, volume };
+const struct adac_s dac_external = { "i2s", init, adac_deinit, power, speaker, headset, volume, NULL };
 static cJSON *i2c_json;
 static int i2c_addr;
 
@@ -51,26 +50,13 @@ static const struct {
 			{\"reg\":26,\"val\":0}, {\"reg\":27,\"val\":0}, {\"reg\":25,\"val\":50}, {\"reg\":38,\"val\":0},		\
 			{\"reg\":39,\"val\":184}, {\"reg\":42,\"val\":184}, {\"reg\":46,\"val\":30}, {\"reg\":47,\"val\":30},	\
 			{\"reg\":48,\"val\":30}, {\"reg\":49,\"val\":30}, {\"reg\":2,\"val\":170}]}" },
-    { "es8311", true,
-		"{\"init\":[																						\
-			{\"reg\":1,\"val\":48}, {\"reg\":2,\"val\":0}, {\"reg\":3,\"val\":16}, {\"reg\":22,\"val\":36},			\
-			{\"reg\":4,\"val\":16}, {\"reg\":5,\"val\":0}, {\"reg\":11,\"val\":0}, {\"reg\":12,\"val\":0},			\
-			{\"reg\":16,\"val\":31}, {\"reg\":17,\"val\":127}, {\"reg\":0,\"val\":128}, {\"reg\":0,\"val\":128},	\
-			{\"reg\":1,\"val\":63}, {\"reg\":1,\"val\":63}, {\"reg\":2,\"val\":0}, {\"reg\":5,\"val\":0},			\
-			{\"reg\":3,\"val\":16}, {\"reg\":4,\"val\":16}, {\"reg\":7,\"val\":0}, {\"reg\":8,\"val\":255},			\
-			{\"reg\":6,\"val\":3}, {\"reg\":1,\"val\":63}, {\"reg\":6,\"val\":3}, {\"reg\":19,\"val\":16},			\
-			{\"reg\":27,\"val\":10}, {\"reg\":28,\"val\":106}, {\"reg\":9,\"val\":12}, {\"reg\":10,\"val\":12},		\
-			{\"reg\":9,\"val\":12}, {\"reg\":10,\"val\":12}, {\"reg\":50,\"val\":178}, {\"reg\":9,\"val\":12},		\
-			{\"reg\":10,\"val\":12}, {\"reg\":23,\"val\":191}, {\"reg\":14,\"val\":2} ,{\"reg\":18,\"val\":0},		\
-			{\"reg\":20,\"val\":26}, {\"reg\":20,\"val\":26}, {\"reg\":13,\"val\":1}, {\"reg\":21,\"val\":64},		\
-			{\"reg\":55,\"val\":72}, {\"reg\":69,\"val\":0}, {\"reg\":50,\"val\":200}]}" },            
 	{ NULL, false, NULL }		
 };
 
 /****************************************************************************************
  * init
  */
-static bool init(char *config, int i2c_port_num, i2s_config_t *i2s_config, bool *mck) {	 
+static bool init(char *config, int i2c_port_num, i2s_config_param_t *i2s_config, bool *mck) {	 
 	char *p;	
 	
 	i2c_addr = adac_init(config, i2c_port_num);
@@ -149,7 +135,7 @@ bool i2c_json_execute(char *set) {
         if ((action = cJSON_GetObjectItemCaseSensitive(item, "gpio")) != NULL) {
             cJSON *level = cJSON_GetObjectItemCaseSensitive(item, "level");
             ESP_LOGI(TAG, "set GPIO %d at %d", action->valueint, level->valueint);
-            if (action->valueint < GPIO_NUM_MAX) gpio_pad_select_gpio(action->valueint);
+            if (action->valueint < GPIO_NUM_MAX) esp_rom_gpio_pad_select_gpio(action->valueint);
             gpio_set_direction_x(action->valueint, GPIO_MODE_OUTPUT);
             gpio_set_level_x(action->valueint, level->valueint);
             continue;

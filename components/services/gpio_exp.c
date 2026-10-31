@@ -15,7 +15,7 @@
 #include "esp_task.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "i2c_bus.h"
 #include "driver/spi_master.h"
 #include "gpio_exp.h"
 
@@ -57,7 +57,7 @@ typedef struct {
 
 static const char TAG[] = "gpio expander";
 
-static void   IRAM_ATTR intr_isr_handler(void* arg);
+static void intr_isr_handler(void *arg);
 static gpio_exp_t* find_expander(gpio_exp_t *expander, int *gpio);
 
 static esp_err_t mpr121_init(gpio_exp_t* self);
@@ -141,10 +141,10 @@ static const struct gpio_exp_model_s {
 	  .write = aw9523_write, },
 };
 
-static EXT_RAM_ATTR uint8_t n_expanders;
-static EXT_RAM_ATTR QueueHandle_t message_queue;
-static EXT_RAM_ATTR gpio_exp_t expanders[4];
-static EXT_RAM_ATTR TaskHandle_t service_task;
+static EXT_RAM_BSS_ATTR uint8_t n_expanders;
+static EXT_RAM_BSS_ATTR QueueHandle_t message_queue;
+static EXT_RAM_BSS_ATTR gpio_exp_t expanders[4];
+static EXT_RAM_BSS_ATTR TaskHandle_t service_task;
 
 /******************************************************************************
  * Retrieve base from an expander reference
@@ -201,7 +201,7 @@ gpio_exp_t* gpio_exp_create(const gpio_exp_config_t *config) {
 	if (!message_queue) {
 		// we allocate TCB but stack is static to avoid SPIRAM fragmentation
 		StaticTask_t* xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-		static EXT_RAM_ATTR StackType_t xStack[4*1024] __attribute__ ((aligned (4)));
+		static EXT_RAM_BSS_ATTR StackType_t xStack[4*1024] __attribute__ ((aligned (4)));
 
 		message_queue = xQueueCreate(4, sizeof(queue_request_t));
 		service_task = xTaskCreateStatic(service_handler, "gpio_expander", sizeof(xStack), NULL, ESP_TASK_PRIO_MIN + 1, xStack, xTaskBuffer);
@@ -209,7 +209,7 @@ gpio_exp_t* gpio_exp_create(const gpio_exp_config_t *config) {
 
 	// set interrupt if possible
 	if (config->intr >= 0) {
-		gpio_pad_select_gpio(config->intr);
+		esp_rom_gpio_pad_select_gpio(config->intr);
 		gpio_set_direction(config->intr, GPIO_MODE_INPUT);
 
 		switch (expander->model->trigger) {
@@ -703,57 +703,42 @@ static void aw9523_write(gpio_exp_t* self) {
 ***************************************************************************************/
 
 /****************************************************************************************
- * I2C write up to 32 bits
+ * I2C write up to 32 bits (using new i2c_master driver)
  */
 static esp_err_t i2c_write(uint8_t port, uint8_t addr, uint8_t reg, uint32_t data, int len) {
-	i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
+	(void)port;  // port is managed by i2c_bus
 	
-	i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, I2C_MASTER_NACK);
-	if (reg != 0xff) i2c_master_write_byte(cmd, reg, I2C_MASTER_NACK);
-
-	// works with our endianness
-	if (len > 1) i2c_master_write(cmd, (uint8_t*) &data, len, I2C_MASTER_NACK);
-	else i2c_master_write_byte(cmd, data, I2C_MASTER_NACK);
-    
-	i2c_master_stop(cmd);
-	esp_err_t ret = i2c_master_cmd_begin(port, cmd, 100 / portTICK_RATE_MS);
-    i2c_cmd_link_delete(cmd);
+	// Build data buffer - endianness matches the old driver behavior
+	uint8_t buf[5];
+	int buf_len = 0;
+	
+	if (reg != 0xff) {
+		buf[buf_len++] = reg;
+	}
+	
+	// Copy data bytes (little endian)
+	for (int i = 0; i < len; i++) {
+		buf[buf_len++] = (data >> (i * 8)) & 0xFF;
+	}
+	
+	// Use 0xFF as "no register" marker for i2c_bus_write when reg already in buffer
+	esp_err_t ret = i2c_bus_write(addr, 0xFF, buf, buf_len);
 	
 	if (ret != ESP_OK) {		
 		ESP_LOGW(TAG, "I2C write failed");
 	}
 	
-    return ret;
+	return ret;
 }
 
 /****************************************************************************************
- * I2C read up to 32 bits
+ * I2C read up to 32 bits (using new i2c_master driver)
  */
 static uint32_t i2c_read(uint8_t port, uint8_t addr, uint8_t reg, int len) {
+	(void)port;  // port is managed by i2c_bus
 	uint32_t data = 0;
 	
-	i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-
-    i2c_master_start(cmd);
-
-	// when using a register, write it's value then the device address again
-	if (reg != 0xff) {
-		i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, I2C_MASTER_NACK);
-		i2c_master_write_byte(cmd, reg, I2C_MASTER_NACK);
-		i2c_master_start(cmd);
-		i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_READ, I2C_MASTER_NACK);
-	} else {
-		i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_READ, I2C_MASTER_NACK);
-	}
-	
-	// works with our endianness
-	if (len > 1) i2c_master_read(cmd, (uint8_t*) &data, len, I2C_MASTER_LAST_NACK);
-	else i2c_master_read_byte(cmd, (uint8_t*) &data, I2C_MASTER_NACK);
-		
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(port, cmd, 100 / portTICK_RATE_MS);
-    i2c_cmd_link_delete(cmd);
+	esp_err_t ret = i2c_bus_read(addr, reg, (uint8_t*)&data, len);
 	
 	if (ret != ESP_OK) {
 		ESP_LOGW(TAG, "I2C read failed");

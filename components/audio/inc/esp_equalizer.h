@@ -21,6 +21,11 @@ extern "C"
 */
 void *esp_equalizer_init(int nch, int g_rate, int n_band, int use_xmms_original_freqs);
 
+/* S31 adapter extension. Signed interleaved PCM, 16 or 32 bits per sample.
+ * The legacy initializer above continues to select 16 bits. */
+void *esp_equalizer_init_bits(int nch, int g_rate, int n_band,
+                            int use_xmms_original_freqs, int bits);
+
 /**
 * @brief     Uninitialize the equalizer handle.
 *

@@ -11,7 +11,7 @@
 namespace cspot {
 class LoginBlob {
  private:
-  int blobSkipPosition = 0;
+  size_t blobSkipPosition = 0;
   std::unique_ptr<Crypto> crypto;
   std::string name, deviceId;
 
@@ -26,7 +26,7 @@ class LoginBlob {
   LoginBlob(std::string name);
   std::vector<uint8_t> authData;
   std::string username = "";
-  int authType;
+  int authType = 0;
 
   // Loading
   void loadZeroconfQuery(std::map<std::string, std::string>& queryParams);

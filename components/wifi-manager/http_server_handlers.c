@@ -53,9 +53,6 @@ union sockaddr_aligned {
     struct sockaddr_in6 sin6;
 } aligned_sockaddr_t;
 esp_err_t post_handler_buff_receive(httpd_req_t * req);
-static const char redirect_payload1[]="<html><head><title>Redirecting to Captive Portal</title><meta http-equiv='refresh' content='0; url=";
-static const char redirect_payload2[]="'></head><body><p>Please wait, refreshing.  If page does not refresh, click <a href='";
-static const char redirect_payload3[]="'>here</a> to login.</p></body></html>";
 
 /**
  * @brief embedded binary data.
@@ -112,7 +109,10 @@ char * http_alloc_get_socket_address(httpd_req_t *req, u8_t local, in_port_t * p
 			inet_ntop(addr.sa.sa_family, ip_addr, ipstr, INET6_ADDRSTRLEN);
 			ESP_LOGV_LOC(TAG,"Processing an IPV6 address : %s", ipstr);
 			*portl =  addr.sin6.sin6_port;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
 			unmap_ipv4_mapped_ipv6(ip_2_ip4(ip_addr), ip_2_ip6(ip_addr));
+#pragma GCC diagnostic pop
 		}
 		else {
 			ip_addr = (ip_addr_t *)&(addr.sin.sin_addr);
@@ -132,27 +132,29 @@ bool is_captive_portal_host_name(httpd_req_t *req){
 	bool request_contains_hostname = false;
 	esp_err_t hn_err =ESP_OK, err=ESP_OK;
 	ESP_LOGD_LOC(TAG,  "Getting adapter host name");
-	if((err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_STA, &host_name )) !=ESP_OK) {
+	esp_netif_t* sta_netif = network_get_active_interface();
+	if(sta_netif && (err = esp_netif_get_hostname(sta_netif, &host_name)) != ESP_OK) {
 		ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(err));
 	}
-	else {
+	else if(host_name) {
 		ESP_LOGD_LOC(TAG,  "Host name is %s",host_name);
 	}
 
    ESP_LOGD_LOC(TAG,  "Getting host name from request");
 	char *req_host = alloc_get_http_header(req, "Host");
 
-	if(tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_AP)){
+	esp_netif_t* ap_netif = network_wifi_get_ap_interface();
+	if(ap_netif && esp_netif_is_netif_up(ap_netif)){
 		ESP_LOGD_LOC(TAG,  "Soft AP is enabled. getting ip info");
 		// Access point is up and running. Get the current IP address
-		tcpip_adapter_ip_info_t ip_info;
-		esp_err_t ap_ip_err = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info);
+		esp_netif_ip_info_t ip_info;
+		esp_err_t ap_ip_err = esp_netif_get_ip_info(ap_netif, &ip_info);
 		if(ap_ip_err != ESP_OK){
 			ESP_LOGE_LOC(TAG,  "Unable to get local AP ip address. Error: %s",esp_err_to_name(ap_ip_err));
 		}
 		else {
-			ESP_LOGD_LOC(TAG,  "getting host name for TCPIP_ADAPTER_IF_AP");
-			if((hn_err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_AP, &ap_host_name )) !=ESP_OK) {
+			ESP_LOGD_LOC(TAG,  "getting host name for AP interface");
+			if((hn_err = esp_netif_get_hostname(ap_netif, &ap_host_name)) != ESP_OK) {
 				ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(hn_err));
 				err=err==ESP_OK?hn_err:err;
 			}
@@ -164,8 +166,8 @@ bool is_captive_portal_host_name(httpd_req_t *req){
 			memset(ap_ip_address, 0x00, IP4ADDR_STRLEN_MAX);
 			if(ap_ip_address){
 				ESP_LOGD_LOC(TAG,  "Converting soft ip address to string");
-				ip4addr_ntoa_r(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
-				ESP_LOGD_LOC(TAG,"TCPIP_ADAPTER_IF_AP is up and has ip address %s ", ap_ip_address);
+				ip4addr_ntoa_r((const ip4_addr_t*)&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
+				ESP_LOGD_LOC(TAG,"AP interface is up and has ip address %s ", ap_ip_address);
 			}
 		}
 
@@ -913,22 +915,23 @@ bail_out:
 char * get_ap_ip_address(){
 	static char ap_ip_address[IP4ADDR_STRLEN_MAX]={};
 
-	tcpip_adapter_ip_info_t ip_info;
+	esp_netif_ip_info_t ip_info;
 	esp_err_t err=ESP_OK;
 	memset(ap_ip_address, 0x00, sizeof(ap_ip_address));
 
 	ESP_LOGD_LOC(TAG,  "checking if soft AP is enabled");
-	if(tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_AP)){
+	esp_netif_t* ap_netif = network_wifi_get_ap_interface();
+	if(ap_netif && esp_netif_is_netif_up(ap_netif)){
 		ESP_LOGD_LOC(TAG,  "Soft AP is enabled. getting ip info");
 		// Access point is up and running. Get the current IP address
-		err = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info);
+		err = esp_netif_get_ip_info(ap_netif, &ip_info);
 		if(err != ESP_OK){
 			ESP_LOGE_LOC(TAG,  "Unable to get local AP ip address. Error: %s",esp_err_to_name(err));
 		}
 		else {
 			ESP_LOGV_LOC(TAG,  "Converting soft ip address to string");
-			ip4addr_ntoa_r(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
-			ESP_LOGD_LOC(TAG,"TCPIP_ADAPTER_IF_AP is up and has ip address %s ", ap_ip_address);
+			ip4addr_ntoa_r((const ip4_addr_t*)&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
+			ESP_LOGD_LOC(TAG,"AP interface is up and has ip address %s ", ap_ip_address);
 		}
 	}
 	else{
@@ -936,149 +939,30 @@ char * get_ap_ip_address(){
 	}
 	return ap_ip_address;
 }
-esp_err_t process_redirect(httpd_req_t *req, const char * status){
-	const char location_prefix[] = "http://";
-	char * ap_ip_address=get_ap_ip_address();
-	char * remote_ip=NULL;
-	in_port_t port=0;
-	char *redirect_url = NULL;
-
-	ESP_LOGD_LOC(TAG,  "Getting remote socket address");
-	remote_ip = http_alloc_get_socket_address(req,0, &port);
-
-	size_t buf_size = strlen(redirect_payload1) +strlen(redirect_payload2) + strlen(redirect_payload3) +2*(strlen(location_prefix)+strlen(ap_ip_address))+1;
-	char * redirect=malloc_init_external(buf_size);
-
-	if(strcasestr(status,"302")){
-		size_t url_buf_size = strlen(location_prefix) + strlen(ap_ip_address)+1+1;
-		redirect_url = malloc_init_external(url_buf_size);
-		memset(redirect_url,0x00,url_buf_size);
-		snprintf(redirect_url, url_buf_size,"%s%s/",location_prefix, ap_ip_address);
-		ESP_LOGW_LOC(TAG,  "Redirecting host [%s] to %s (from uri %s)",remote_ip, redirect_url,req->uri);
-		httpd_resp_set_hdr(req,"Location",redirect_url);
-		snprintf(redirect, buf_size,"OK");
-	}
-	else {
-
-		snprintf(redirect, buf_size,"%s%s%s%s%s%s%s",redirect_payload1, location_prefix, ap_ip_address,redirect_payload2, location_prefix, ap_ip_address,redirect_payload3);
-		ESP_LOGW_LOC(TAG,  "Responding to host [%s] (from uri %s) with redirect html page %s",remote_ip, req->uri,redirect);
-	}
-
-	httpd_resp_set_type(req, HTTPD_TYPE_TEXT);
-	httpd_resp_set_hdr(req,"Cache-Control","no-cache");
-	httpd_resp_set_status(req, status);
-	httpd_resp_send(req, redirect, HTTPD_RESP_USE_STRLEN);
-	FREE_AND_NULL(redirect);
-	FREE_AND_NULL(redirect_url);
-	FREE_AND_NULL(remote_ip);
-
-	return ESP_OK;
-}
-esp_err_t redirect_200_ev_handler(httpd_req_t *req){
-	ESP_LOGD_LOC(TAG,"Processing known redirect url %s",req->uri);
-	process_redirect(req,"200 OK");
-	return ESP_OK;
-}
-esp_err_t redirect_processor(httpd_req_t *req, httpd_err_code_t error){
-	esp_err_t err=ESP_OK;
-	const char * host_name=NULL;
-	const char * ap_host_name=NULL;
-	char * user_agent=NULL;
-	char * remote_ip=NULL;
-	char * sta_ip_address=NULL;
-	char * ap_ip_address=get_ap_ip_address();
-	char * socket_local_address=NULL;
-	bool request_contains_hostname = false;
-	bool request_contains_ap_ip_address 	= false;
-	bool request_is_sta_ip_address 	= false;
-	bool connected_to_ap_ip_interface 	= false;
-	bool connected_to_sta_ip_interface = false;
-	bool useragentiscaptivenetwork = false;
-
+/* Captive detection is served only on the recovery AP, never on the LAN. */
+esp_err_t redirect_processor(httpd_req_t *req, httpd_err_code_t error) {
+    const char *ap_ip = get_ap_ip_address();
     in_port_t port=0;
-    ESP_LOGV_LOC(TAG,  "Getting remote socket address");
-    remote_ip = http_alloc_get_socket_address(req,0, &port);
+    char *local_ip = http_alloc_get_socket_address(req,1,&port);
+    bool captive = network_wifi_setup_enabled() && ap_ip && *ap_ip &&
+                   local_ip && !strcmp(local_ip,ap_ip);
+    free(local_ip);
+    if (!captive || (error && error != HTTPD_404_NOT_FOUND))
+        return httpd_resp_send_err(req,error ? error : HTTPD_404_NOT_FOUND,NULL);
 
-	ESP_LOGW_LOC(TAG, "%s requested invalid URL: [%s]",remote_ip, req->uri);
-    if(network_status_lock_sta_ip_string(portMAX_DELAY)){
-		sta_ip_address = strdup_psram(network_status_get_sta_ip_string());
-		network_status_unlock_sta_ip_string();
-	}
-	else {
-    	ESP_LOGE(TAG,"Unable to obtain local IP address from WiFi Manager.");
-    	httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR , NULL);
-	}
-
-
-    ESP_LOGV_LOC(TAG,  "Getting host name from request");
-    char *req_host = alloc_get_http_header(req, "Host");
-
-    user_agent = alloc_get_http_header(req,"User-Agent");
-    if((useragentiscaptivenetwork = (user_agent!=NULL  && strcasestr(user_agent,"CaptiveNetworkSupport"))==true)){
-    	ESP_LOGW_LOC(TAG,"Found user agent that supports captive networks! [%s]",user_agent);
-    }
-
-	esp_err_t hn_err = ESP_OK;
-	ESP_LOGV_LOC(TAG,  "Getting adapter host name");
-	if((hn_err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_STA, &host_name )) !=ESP_OK) {
-		ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(hn_err));
-		err=err==ESP_OK?hn_err:err;
-	}
-	else {
-		ESP_LOGV_LOC(TAG,  "Host name is %s",host_name);
-	}
-
-
-	in_port_t loc_port=0;
-	ESP_LOGV_LOC(TAG,  "Getting local socket address");
-	socket_local_address= http_alloc_get_socket_address(req,1, &loc_port);
-
-
-
-    ESP_LOGD_LOC(TAG,  "Peer IP: %s [port %u], System AP IP address: %s, System host: %s. Requested Host: [%s], uri [%s]",STR_OR_NA(remote_ip), port, STR_OR_NA(ap_ip_address), STR_OR_NA(host_name), STR_OR_NA(req_host), req->uri);
-    /* captive portal functionality: redirect to access point IP for HOST that are not the access point IP OR the STA IP */
-	/* determine if Host is from the STA IP address */
-
-    if((request_contains_hostname 		= (host_name!=NULL) && (req_host!=NULL) && strcasestr(req_host,host_name)) == true){
-    	ESP_LOGD_LOC(TAG,"http request host = system host name %s", req_host);
-    }
-    else if((request_contains_hostname 		= (ap_host_name!=NULL) && (req_host!=NULL) && strcasestr(req_host,ap_host_name)) == true){
-    	ESP_LOGD_LOC(TAG,"http request host = AP system host name %s", req_host);
-    }
-    if((request_contains_ap_ip_address 	= (ap_ip_address!=NULL) && (req_host!=NULL) && strcasestr(req_host,ap_ip_address))== true){
-    	ESP_LOGD_LOC(TAG,"http request host is access point ip address %s", req_host);
-    }
-    if((connected_to_ap_ip_interface 	= (ap_ip_address!=NULL) && (socket_local_address!=NULL) && strcasestr(socket_local_address,ap_ip_address))==true){
-    	ESP_LOGD_LOC(TAG,"http request is connected to access point interface IP %s", ap_ip_address);
-    }
-    if((request_is_sta_ip_address 	= (sta_ip_address!=NULL) && (req_host!=NULL) && strcasestr(req_host,sta_ip_address))==true){
-    	ESP_LOGD_LOC(TAG,"http request host is WiFi client ip address %s", req_host);
-    }
-    if((connected_to_sta_ip_interface = (sta_ip_address!=NULL) && (socket_local_address!=NULL) && strcasestr(sta_ip_address,socket_local_address))==true){
-    	ESP_LOGD_LOC(TAG,"http request is connected to WiFi client ip address %s", sta_ip_address);
-    }
-
-   if((error == 0) || (error == HTTPD_404_NOT_FOUND && connected_to_ap_ip_interface && !(request_contains_ap_ip_address || request_contains_hostname ))) {
-		process_redirect(req,"302 Found");
-
-	}
-	else {
-		ESP_LOGD_LOC(TAG,"URL not found, and not processing captive portal so throw regular 404 error");
-		httpd_resp_send_err(req, error, NULL);
-	}
-
-	FREE_AND_NULL(socket_local_address);
-
-	FREE_AND_NULL(req_host);
-	FREE_AND_NULL(user_agent);
-
-    FREE_AND_NULL(sta_ip_address);
-	FREE_AND_NULL(remote_ip);
-	return err;
-
+    char url[48];
+    snprintf(url,sizeof(url),"http://%s/#tab-wifi",ap_ip);
+    httpd_resp_set_status(req,"302 Found");
+    httpd_resp_set_hdr(req,"Location",url);
+    httpd_resp_set_hdr(req,"Cache-Control","no-store");
+    httpd_resp_set_type(req,"text/plain");
+    return httpd_resp_send(req,"Open Wi-Fi settings",HTTPD_RESP_USE_STRLEN);
 }
-esp_err_t redirect_ev_handler(httpd_req_t *req){
-	return redirect_processor(req,0);
+esp_err_t redirect_200_ev_handler(httpd_req_t *req) {
+    return redirect_processor(req,0);
+}
+esp_err_t redirect_ev_handler(httpd_req_t *req) {
+    return redirect_processor(req,0);
 }
 
 esp_err_t messages_get_handler(httpd_req_t *req){

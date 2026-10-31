@@ -15,6 +15,10 @@
 
 #include "bt_app_core.h"
 #include "bt_app_sink.h"
+#include "bt_sink_codec.h"
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "esp_a2dp_legacy_api.h"
+#endif
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
@@ -27,6 +31,7 @@
 #include "freertos/task.h"
 #include "tools.h"
 #include "audio_controls.h"
+#include "audio_source.h"
 #include "sys/lock.h"
 #include "display.h"
 
@@ -46,9 +51,18 @@ static const char BT_RC_CT_TAG[] = "RCCT";
 #endif
 
 static char * bt_name = NULL;
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+static unsigned registered_seps;
+static bool bt_setup_ok(esp_err_t err, const char *operation) {
+    if (err == ESP_OK) return true;
+    ESP_LOGE(BT_AV_TAG, "%s failed: %s", operation, esp_err_to_name(err));
+    return false;
+}
+#endif
 
 static bool (*bt_app_a2d_cmd_cb)(bt_sink_cmd_t cmd, ...);
 static void (*bt_app_a2d_data_cb)(const uint8_t *data, uint32_t len);
+static bt_data_cb_t bt_app_a2d_data32_cb;
 
 /* handler for bluetooth stack enabled events */
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
@@ -62,7 +76,11 @@ static void volume_set_by_local_host(int value, bool is_step);
 static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_parameter);
 
 static const char *s_a2d_conn_state_str[] = {"Disconnected", "Connecting", "Connected", "Disconnecting"};
+#if CONFIG_IDF_TARGET_ESP32S31
+static const char *s_a2d_audio_state_str[] = {"Suspended", "Started"};
+#else
 static const char *s_a2d_audio_state_str[] = {"Suspended", "Stopped", "Started"};
+#endif
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
 
 static _lock_t s_volume_lock;
@@ -76,7 +94,7 @@ static bt_cmd_vcb_t cmd_handler_chain;
 
 #define METADATA_LEN 128
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
 	char artist[METADATA_LEN + 1];
 	char album[METADATA_LEN + 1];
 	char title[METADATA_LEN + 1];
@@ -162,9 +180,11 @@ static bool cmd_handler(bt_sink_cmd_t cmd, ...) {
 	va_list args;	
 	
 	va_start(args, cmd);
+	audio_source_lock();
 	
 	// handle audio event and stop if forbidden
 	if (!cmd_handler_chain(cmd, args)) {
+		audio_source_unlock();
 		va_end(args);
 		return false;
 	}
@@ -172,9 +192,11 @@ static bool cmd_handler(bt_sink_cmd_t cmd, ...) {
 	// now handle events for display
 	switch(cmd) {
 	case BT_SINK_AUDIO_STARTED:
+		actrls_set(controls, false, NULL, actrls_ir_action);
 		displayer_control(DISPLAYER_ACTIVATE, "BLUETOOTH", false);
 		break;
 	case BT_SINK_AUDIO_STOPPED:
+		actrls_unset();
 		displayer_control(DISPLAYER_SUSPEND);
 		break;		
 	case BT_SINK_PLAY:
@@ -200,6 +222,7 @@ static bool cmd_handler(bt_sink_cmd_t cmd, ...) {
 	}
 	
 	va_end(args);
+	audio_source_unlock();
 	
 	return true;
 }
@@ -210,16 +233,20 @@ void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT:
     case ESP_A2D_AUDIO_STATE_EVT:
-    case ESP_A2D_AUDIO_CFG_EVT: {
+    case ESP_A2D_AUDIO_CFG_EVT:
+    case ESP_A2D_PROF_STATE_EVT:
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    case ESP_A2D_SEP_REG_STATE_EVT:
+#endif
+    case ESP_A2D_SNK_PSC_CFG_EVT:
+    case ESP_A2D_SNK_SET_DELAY_VALUE_EVT:
+    case ESP_A2D_SNK_GET_DELAY_VALUE_EVT:
+    {
         bt_app_work_dispatch(bt_av_hdl_a2d_evt, event, param, sizeof(esp_a2d_cb_param_t), NULL);
         break;
     }
-    case ESP_A2D_PROF_STATE_EVT: {
-        ESP_LOGI(BT_AV_TAG, "Bluetooth Init complete");
-        break;
-    }    
     default:
-        ESP_LOGE(BT_AV_TAG, "Invalid A2DP event: %d", event);
+        ESP_LOGE(BT_AV_TAG, "Unahdled A2DP event: %d", event);
         break;
     }
 }
@@ -242,14 +269,18 @@ void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param
         /* fall through */
     case ESP_AVRC_CT_CONNECTION_STATE_EVT:
     case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
+    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
-    case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
+    case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT:
+    case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
+    case ESP_AVRC_CT_PROF_STATE_EVT:
+    {
         bt_app_work_dispatch(bt_av_hdl_avrc_ct_evt, event, param, sizeof(esp_avrc_ct_cb_param_t), NULL);
         break;
     }
     default:
-        ESP_LOGE(BT_RC_CT_TAG, "Invalid AVRC event: %d", event);
+        ESP_LOGE(BT_RC_CT_TAG, "Unhandled CT AVRC event: %d", event);
         break;
     }
 }
@@ -262,10 +293,11 @@ void bt_app_rc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param
     case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
     case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+    case ESP_AVRC_TG_PROF_STATE_EVT:
         bt_app_work_dispatch(bt_av_hdl_avrc_tg_evt, event, param, sizeof(esp_avrc_tg_cb_param_t), NULL);
         break;
     default:
-        ESP_LOGE(BT_RC_TG_TAG, "Invalid AVRC event: %d", event);
+        ESP_LOGE(BT_RC_TG_TAG, "Unhandled TG AVRC event: %d", event);
         break;
     }
 }
@@ -278,9 +310,14 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
     case ESP_A2D_CONNECTION_STATE_EVT: {
         a2d = (esp_a2d_cb_param_t *)(p_param);
         uint8_t *bda = a2d->conn_stat.remote_bda;
-        ESP_LOGD(BT_AV_TAG, "A2DP connection state: %s, [%02x:%02x:%02x:%02x:%02x:%02x]",
+        ESP_LOGI(BT_AV_TAG, "A2DP connection state: %s, [%02x:%02x:%02x:%02x:%02x:%02x]",
              s_a2d_conn_state_str[a2d->conn_stat.state], bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            bt_sink_codec_stop(true);
+            (*bt_app_a2d_cmd_cb)(BT_SINK_AUDIO_STOPPED);
+            s_audio = AUDIO_IDLE;
+#endif
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 			(*bt_app_a2d_cmd_cb)(BT_SINK_DISCONNECTED);
         } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED){
@@ -293,7 +330,7 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
     }
     case ESP_A2D_AUDIO_STATE_EVT: {
         a2d = (esp_a2d_cb_param_t *)(p_param);
-        ESP_LOGD(BT_AV_TAG, "A2DP audio state: %s", s_a2d_audio_state_str[a2d->audio_stat.state]);
+        ESP_LOGI(BT_AV_TAG, "A2DP audio state: %s", s_a2d_audio_state_str[a2d->audio_stat.state]);
 
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
 			s_audio = AUDIO_CONNECTED;
@@ -307,45 +344,122 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
 				// if PLAY is sent before AUDIO_STARTED, generate the event here
 				s_audio = AUDIO_PLAYING;
 				(*bt_app_a2d_cmd_cb)(BT_SINK_PLAY);
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+                if (!bt_sink_codec_start()) {
+                    (*bt_app_a2d_cmd_cb)(BT_SINK_AUDIO_STOPPED);
+                    s_audio = AUDIO_IDLE;
+                    ESP_LOGE(BT_AV_TAG, "Cannot start negotiated decoder");
+                    break;
+                }
+#endif
 				
 				// force metadata update
 				update_metadata(true);
 				
-				actrls_set(controls, false, NULL, actrls_ir_action);
 			} else {
 				// if decoder is busy, stop it (would be better to not ACK this command, but don't know how)
 				esp_avrc_ct_send_passthrough_cmd(tl++ & 0x0f, ESP_AVRC_PT_CMD_STOP, ESP_AVRC_PT_CMD_STATE_PRESSED);	
 			}	
-		} else if (ESP_A2D_AUDIO_STATE_STOPPED == a2d->audio_stat.state ||
-				   ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND == a2d->audio_stat.state) {
+		}
+#if CONFIG_IDF_TARGET_ESP32S31
+        else if (ESP_A2D_AUDIO_STATE_SUSPEND == a2d->audio_stat.state) {
+#if CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            bt_sink_codec_stop(false);
+#endif
+#else
+        else if (ESP_A2D_AUDIO_STATE_STOPPED == a2d->audio_stat.state ||
+                 ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND == a2d->audio_stat.state) {
+#endif
 			(*bt_app_a2d_cmd_cb)(BT_SINK_AUDIO_STOPPED);
 			s_audio = AUDIO_IDLE;
-			actrls_unset();
 		}	
         break;
     }
     case ESP_A2D_AUDIO_CFG_EVT: {
         a2d = (esp_a2d_cb_param_t *)(p_param);
-        ESP_LOGD(BT_AV_TAG, "A2DP audio stream configuration, codec type %d", a2d->audio_cfg.mcc.type);
-        // for now only SBC stream is supported
-        if (a2d->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
+        esp_a2d_mcc_t *p_mcc = &a2d->audio_cfg.mcc;
+        ESP_LOGI(BT_AV_TAG, "A2DP audio stream configuration, codec type: %d", p_mcc->type);
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+        s_sample_rate = bt_sink_codec_configure(p_mcc);
+        if (s_sample_rate) (*bt_app_a2d_cmd_cb)(BT_SINK_RATE, s_sample_rate);
+#else
+        /* for now only SBC stream is supported */
+        if (p_mcc->type == ESP_A2D_MCT_SBC)
+        {
             s_sample_rate = 16000;
-            char oct0 = a2d->audio_cfg.mcc.cie.sbc[0];
-            if (oct0 & (0x01 << 6)) {
+            int ch_count = 2;
+            if (p_mcc->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_32K)
+            {
                 s_sample_rate = 32000;
-            } else if (oct0 & (0x01 << 5)) {
+            }
+            else if (p_mcc->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_44K)
+            {
                 s_sample_rate = 44100;
-            } else if (oct0 & (0x01 << 4)) {
+            }
+            else if (p_mcc->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_48K)
+            {
                 s_sample_rate = 48000;
             }
-			(*bt_app_a2d_cmd_cb)(BT_SINK_RATE, s_sample_rate);
-            
-            ESP_LOGI(BT_AV_TAG, "Configure audio player %x-%x-%x-%x",
-                     a2d->audio_cfg.mcc.cie.sbc[0],
-                     a2d->audio_cfg.mcc.cie.sbc[1],
-                     a2d->audio_cfg.mcc.cie.sbc[2],
-                     a2d->audio_cfg.mcc.cie.sbc[3]);
+
+            if (p_mcc->cie.sbc_info.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO)
+            {
+                ch_count = 1;
+            }
+            (*bt_app_a2d_cmd_cb)(BT_SINK_RATE, s_sample_rate);
+
+            ESP_LOGI(BT_AV_TAG, "Configure audio player ch:%x freq:%x alloc:%x sub:%x block:%x min_bp:%u max_bp:%u",
+                     p_mcc->cie.sbc_info.ch_mode,
+                     p_mcc->cie.sbc_info.samp_freq,
+                     p_mcc->cie.sbc_info.alloc_mthd,
+                     p_mcc->cie.sbc_info.num_subbands,
+                     p_mcc->cie.sbc_info.block_len,
+                     p_mcc->cie.sbc_info.min_bitpool,
+                     p_mcc->cie.sbc_info.max_bitpool);
             ESP_LOGI(BT_AV_TAG, "Audio player configured, sample rate=%d", s_sample_rate);
+        }
+#endif
+        break;
+    }
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    case ESP_A2D_SEP_REG_STATE_EVT:
+        a2d = p_param;
+        ESP_LOGI(BT_AV_TAG, "SEP id=%d registration state=%d", a2d->a2d_sep_reg_stat.seid,
+                 a2d->a2d_sep_reg_stat.reg_state);
+        if (a2d->a2d_sep_reg_stat.reg_state == ESP_A2D_SEP_REG_SUCCESS &&
+            a2d->a2d_sep_reg_stat.seid < bt_sink_codec_endpoint_count()) {
+            registered_seps |= 1U << a2d->a2d_sep_reg_stat.seid;
+            if (registered_seps == (1U << bt_sink_codec_endpoint_count()) - 1) {
+                bt_setup_ok(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE), "Enable discoverability");
+                ESP_LOGI(BT_AV_TAG, "All %u Bluetooth codec endpoints ready", bt_sink_codec_endpoint_count());
+            }
+        } else {
+            ESP_LOGE(BT_AV_TAG, "Codec endpoint registration failed; receiver remains unavailable");
+        }
+        break;
+#endif
+    case ESP_A2D_PROF_STATE_EVT:
+        a2d = (esp_a2d_cb_param_t *)(p_param);
+        ESP_LOGI(BT_AV_TAG, "A2DP profile state: %s",
+            a2d->a2d_prof_stat.init_state == ESP_A2D_INIT_SUCCESS ? "initialized" : "deinitialized");
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+        if (a2d->a2d_prof_stat.init_state == ESP_A2D_INIT_SUCCESS) {
+            registered_seps = 0;
+            if (!bt_setup_ok(esp_a2d_sink_register_audio_data_callback(bt_sink_codec_receive), "Audio callback")) break;
+            bt_setup_ok(bt_sink_codec_register_endpoints(), "Codec endpoints");
+        }
+#endif
+        break;
+    case ESP_A2D_SNK_PSC_CFG_EVT:
+    {
+        a2d = (esp_a2d_cb_param_t *)(p_param);
+        ESP_LOGI(BT_AV_TAG, "protocol service capabilities configured: 0x%x ", a2d->a2d_psc_cfg_stat.psc_mask);
+        if (a2d->a2d_psc_cfg_stat.psc_mask & ESP_A2D_PSC_DELAY_RPT)
+        {
+            ESP_LOGI(BT_AV_TAG, "Peer device support delay reporting");
+        }
+        else
+        {
+            ESP_LOGI(BT_AV_TAG, "Peer device unsupported delay reporting");
         }
         break;
     }
@@ -485,6 +599,11 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
         bt_av_play_pos_changed();
         break;
     }
+    case ESP_AVRC_CT_PROF_STATE_EVT:
+    {
+        ESP_LOGD(BT_RC_CT_TAG, "AVRCP controller init/deinit");
+        break;
+    }
     default:
         ESP_LOGE(BT_RC_CT_TAG, "%s unhandled evt %d", __func__, event);
         break;
@@ -558,10 +677,32 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
         ESP_LOGD(BT_RC_TG_TAG, "AVRC remote features %x, CT features %x", rc->rmt_feats.feat_mask, rc->rmt_feats.ct_feat_flag);
         break;
     }
+    case ESP_AVRC_TG_PROF_STATE_EVT:
+    {
+        if (ESP_AVRC_INIT_SUCCESS == rc->avrc_tg_init_stat.state)
+        {
+            ESP_LOGD(BT_RC_CT_TAG, "AVRCP TG STATE: Init Complete");
+        }
+        else if (ESP_AVRC_DEINIT_SUCCESS == rc->avrc_tg_init_stat.state)
+        {
+            ESP_LOGD(BT_RC_CT_TAG, "AVRCP TG STATE: Deinit Complete");
+        }
+        else
+        {
+            ESP_LOGE(BT_RC_CT_TAG, "AVRCP TG STATE error: %d", rc->avrc_tg_init_stat.state);
+        }
+        break;
+    }
     default:
         ESP_LOGE(BT_RC_TG_TAG, "%s unhandled evt %d", __func__, event);
         break;
     }
+}
+
+void bt_sink_init_with_pcm32(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb, bt_data_cb_t data32_cb)
+{
+    bt_app_a2d_data32_cb = data32_cb;
+    bt_sink_init(cmd_cb, data_cb);
 }
 
 void bt_sink_init(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb)
@@ -577,6 +718,7 @@ void bt_sink_init(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb)
 	sink_volume = atol(item);
 	free(item);
 
+#if !CONFIG_IDF_TARGET_ESP32S31
     /*
      * Set default parameters for Legacy Pairing
      */
@@ -607,10 +749,14 @@ void bt_sink_init(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb)
 	esp_bt_gap_set_pin(pin_type, strlen(pin_code), esp_pin_code);
 	
 	free(pin_code);
+#endif
 }
 
 void bt_sink_deinit(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    bt_sink_codec_stop(true);
+#endif
 	bt_app_task_shut_down();
 }
 
@@ -619,15 +765,15 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT: {
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGD(BT_AV_TAG, "authentication success: %s", param->auth_cmpl.device_name);
-            esp_log_buffer_hex(BT_AV_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
+            ESP_LOGI(BT_AV_TAG, "authentication success: %s", param->auth_cmpl.device_name);
+            ESP_LOG_BUFFER_HEX(BT_AV_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
         } else {
             ESP_LOGE(BT_AV_TAG, "authentication failed, status:%d", param->auth_cmpl.stat);
         }
         break;
     }
 
-#if (CONFIG_BT_SSP_ENABLED == true)
+#if CONFIG_IDF_TARGET_ESP32S31 || CONFIG_BT_SSP_ENABLED
     case ESP_BT_GAP_CFM_REQ_EVT:
         ESP_LOGD(BT_AV_TAG, "ESP_BT_GAP_CFM_REQ_EVT Please compare the numeric value: %d", param->cfm_req.num_val);
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
@@ -655,8 +801,9 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
     case BT_APP_EVT_STACK_UP: {
         /* set up device name */
 		bt_name = (char * )config_alloc_get_default(NVS_TYPE_STR, "bt_name", CONFIG_BT_NAME, 0);
-		esp_bt_dev_set_device_name(bt_name);
-		free(bt_name);
+        esp_bt_gap_set_device_name(bt_name);
+        ESP_LOGI(BT_AV_TAG, "Bluetooth sink name: %s", bt_name);
+        free(bt_name);
         esp_bt_gap_register_callback(bt_app_gap_cb);
 
         /* initialize AVRCP controller */
@@ -672,11 +819,18 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 
         /* initialize A2DP sink */
         esp_a2d_register_callback(&bt_app_a2d_cb);
-        esp_a2d_sink_register_data_callback(bt_app_a2d_data_cb);
-        esp_a2d_sink_init();
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+        if (!bt_setup_ok(bt_sink_codec_init(bt_app_a2d_data_cb, bt_app_a2d_data32_cb), "Decoder initialization")) break;
+        if (!bt_setup_ok(esp_a2d_sink_init(), "A2DP initialization")) break;
+        /* Registration waits for ESP_A2D_INIT_SUCCESS. Discovery waits for
+         * both SEP confirmations; init is asynchronous in IDF 6.1. */
+#else
+        ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(bt_app_a2d_data_cb));
+        ESP_ERROR_CHECK(esp_a2d_sink_init());
 
         /* set discoverable and connectable mode, wait to be connected */
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+#endif
         break;
     }
     default:

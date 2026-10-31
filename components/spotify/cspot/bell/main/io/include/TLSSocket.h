@@ -12,19 +12,31 @@
 #include <stdlib.h>  // for size_t
 #include <string>    // for string
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "esp_tls.h"
+#else
 #include "mbedtls/ctr_drbg.h"     // for mbedtls_ctr_drbg_context
 #include "mbedtls/entropy.h"      // for mbedtls_entropy_context
 #include "mbedtls/net_sockets.h"  // for mbedtls_net_context
 #include "mbedtls/ssl.h"          // for mbedtls_ssl_config, mbedtls_ssl_con...
+#endif
 
 namespace bell {
 class TLSSocket : public bell::Socket {
  private:
+#if CONFIG_IDF_TARGET_ESP32S31
+  esp_tls_t *tls = nullptr;
+  int fd = -1;
+#else
   mbedtls_net_context server_fd;
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
   mbedtls_ssl_context ssl;
   mbedtls_ssl_config conf;
+#endif
 
   bool isClosed = true;
 
@@ -40,7 +52,13 @@ class TLSSocket : public bell::Socket {
   bool isOpen();
 
   void close();
-  int getFd() { return server_fd.fd; }
+  int getFd() {
+#if CONFIG_IDF_TARGET_ESP32S31
+    return fd;
+#else
+    return server_fd.fd;
+#endif
+  }
 };
 
 }  // namespace bell

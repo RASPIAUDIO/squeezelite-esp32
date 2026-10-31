@@ -444,8 +444,11 @@ void output_close_common(void) {
 
 void output_flush(void) {
 	LOG_INFO("flush output buffer (full)");
-	buf_flush(outputbuf);
 	LOCK;
+#if CONFIG_MNCAST_SENDSPIN
+    if (output.external) { UNLOCK; return; }
+#endif
+    _buf_flush(outputbuf);
 	output.fade = FADE_INACTIVE;
 	if (output.state != OUTPUT_OFF) {
 		output.state = OUTPUT_STOPPED;
@@ -461,6 +464,9 @@ void output_flush(void) {
 bool output_flush_streaming(void) {
 	LOG_INFO("flush output buffer (streaming)");
 	LOCK;
+#if CONFIG_MNCAST_SENDSPIN
+    if (output.external) { UNLOCK; return false; }
+#endif
 	bool flushed = output.track_start != NULL;
 	if (output.track_start) {
 		outputbuf->writep = output.track_start;

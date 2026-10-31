@@ -18,7 +18,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "driver/rmt.h"
+#include "driver/rmt_tx.h"
 #include "platform_config.h"
 #include "gpio_exp.h"
 #include "led.h"
@@ -29,7 +29,7 @@
 #define MAX_LED	8
 #define BLOCKTIME	10	// up to portMAX_DELAY
 
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#if !SOC_LEDC_SUPPORT_HS_MODE
 #define LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
 #else
 #define LEDC_SPEED_MODE LEDC_HIGH_SPEED_MODE
@@ -39,22 +39,29 @@ static const char *TAG = "led";
 
 #define RMT_CLK (40/2)
 
-static int8_t led_rmt_channel = -1;
 static uint32_t scale24(uint32_t bright, uint8_t);
+
+// RMT symbol structure for new API
+typedef struct {
+    uint16_t duration0;
+    uint16_t level0;
+    uint16_t duration1;
+    uint16_t level1;
+} rmt_symbol_t;
 
 static const struct rmt_led_param_s {
     led_type_t type;
     uint8_t bits;
     // number of ticks in nanoseconds converted in RMT_CLK ticks
-    rmt_item32_t bit_0;
-    rmt_item32_t bit_1;
+    rmt_symbol_t bit_0;
+    rmt_symbol_t bit_1;
     uint32_t green, red;
     uint32_t (*scale)(uint32_t, uint8_t);
-} rmt_led_param[] =  {
-    { LED_WS2812, 24, {{{350 / RMT_CLK, 1, 1000 / RMT_CLK, 0}}}, {{{1000 / RMT_CLK, 1, 350 / RMT_CLK, 0}}}, 0xff0000, 0x00ff00, scale24 },
-    { .type = -1 } };
+} rmt_led_param[] = {
+    {LED_WS2812, 24, {350 / RMT_CLK, 1, 1000 / RMT_CLK, 0}, {1000 / RMT_CLK, 1, 350 / RMT_CLK, 0}, 0xff0000, 0x00ff00, scale24},
+    {.type = -1}};
 
-static EXT_RAM_ATTR struct led_s {
+static EXT_RAM_BSS_ATTR struct led_s {
 	gpio_num_t gpio;
 	bool on;
 	uint32_t color;
@@ -65,9 +72,10 @@ static EXT_RAM_ATTR struct led_s {
 	int pushedon, pushedoff;
 	bool pushed;
 	TimerHandle_t timer;
+    rmt_channel_handle_t rmt_chan;
 } leds[MAX_LED];
 
-// can't use EXT_RAM_ATTR for initialized structure
+// can't use EXT_RAM_BSS_ATTR for initialized structure
 static struct led_config_s {
 	int gpio;
 	int color;
@@ -95,13 +103,20 @@ static void set_level(struct led_s *led, bool on) {
     if (led->rmt) {
         uint32_t data = on ? led->rmt->scale(led->color, led->bright) : 0;
         uint32_t mask = 1 << (led->rmt->bits - 1);
-        rmt_item32_t buffer[led->rmt->bits];
+        rmt_symbol_word_t buffer[led->rmt->bits];
         for (uint32_t bit = 0; bit < led->rmt->bits; bit++) {
             uint32_t set = data & mask;
-            buffer[bit] = set ? led->rmt->bit_1 : led->rmt->bit_0;
+            rmt_symbol_t symbol = set ? led->rmt->bit_1 : led->rmt->bit_0;
+            buffer[bit].duration0 = symbol.duration0;
+            buffer[bit].level0 = symbol.level0;
+            buffer[bit].duration1 = symbol.duration1;
+            buffer[bit].level1 = symbol.level1;
             mask >>= 1;
         }
-        rmt_write_items(led->channel, buffer, led->rmt->bits, false);
+        rmt_transmit_config_t tx_config = {
+            .loop_count = 0,
+        };
+        rmt_transmit(led->rmt_chan, NULL, buffer, sizeof(buffer), &tx_config);
     } else if (led->bright < 0 || led->gpio >= GPIO_NUM_MAX) {
         gpio_set_level_x(led->gpio, on ? led->color : !led->color);
 	} else {
@@ -126,7 +141,7 @@ static void vCallbackFunction( TimerHandle_t xTimer ) {
 	if (!led->on && led->offtime == -1) return;
 
 	// regular blinking
-	xTimerChangePeriod(xTimer, (led->on ? led->ontime : led->offtime) / portTICK_RATE_MS, BLOCKTIME);
+	xTimerChangePeriod(xTimer, (led->on ? led->ontime : led->offtime) / portTICK_PERIOD_MS, BLOCKTIME);
 }
 
 /****************************************************************************************
@@ -166,7 +181,7 @@ bool led_blink_core(int idx, int ontime, int offtime, bool pushed) {
 	} else {
 		if (!leds[idx].timer) {
 			ESP_LOGD(TAG,"led %d, Creating timer", idx);
-			leds[idx].timer = xTimerCreate("ledTimer", ontime / portTICK_RATE_MS, pdFALSE, (void *)&leds[idx], vCallbackFunction);
+			leds[idx].timer = xTimerCreate("ledTimer", ontime / portTICK_PERIOD_MS, pdFALSE, (void *)&leds[idx], vCallbackFunction);
 		}
         leds[idx].on = true;
 		set_level(leds + idx, true);
@@ -241,16 +256,19 @@ bool led_config(int idx, gpio_num_t gpio, int color, int bright, led_type_t type
         for (const struct rmt_led_param_s *p = rmt_led_param; !leds[idx].rmt && p->type >= 0; p++) if (p->type == type) leds[idx].rmt = p;
         if (!leds[idx].rmt) return false;
 
-        if (led_rmt_channel < 0) led_rmt_channel = RMT_NEXT_TX_CHANNEL();
-        leds[idx].channel = led_rmt_channel;
 		leds[idx].bright = bright > 0 ? bright : 100;
 
-        // set counter clock to 40MHz
-        rmt_config_t config = RMT_DEFAULT_CONFIG_TX(gpio, leds[idx].channel);
-        config.clk_div = 2;
-
-        rmt_config(&config);
-        rmt_driver_install(config.channel, 0, 0);
+        // Configure RMT TX channel with new API
+        rmt_tx_channel_config_t tx_chan_config = {
+            .clk_src = RMT_CLK_SRC_DEFAULT,
+            .gpio_num = gpio,
+            .mem_block_symbols = 64,
+            .resolution_hz = 40000000 / 2, // 40MHz / 2 = 20MHz
+            .trans_queue_depth = 1,
+        };
+        
+        ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &leds[idx].rmt_chan));
+        ESP_ERROR_CHECK(rmt_enable(leds[idx].rmt_chan));
 	} else if (bright < 0 || gpio >= GPIO_NUM_MAX) {
 		gpio_pad_select_gpio_x(gpio);
 		gpio_set_direction_x(gpio, GPIO_MODE_OUTPUT);

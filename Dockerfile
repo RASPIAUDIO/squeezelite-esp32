@@ -2,43 +2,41 @@ FROM ubuntu:20.04
 
 
 ARG DEBIAN_FRONTEND=noninteractive
+ENV GCC_TOOLS_BASE=/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32-elf/bin/xtensa-esp32-elf-
 # To build the image for a branch or a tag of IDF, pass --build-arg IDF_CLONE_BRANCH_OR_TAG=name.
 # To build the image with a specific commit ID of IDF, pass --build-arg IDF_CHECKOUT_REF=commit-id.
 # It is possibe to combine both, e.g.:
 #   IDF_CLONE_BRANCH_OR_TAG=release/vX.Y
 #   IDF_CHECKOUT_REF=<some commit on release/vX.Y branch>.
-# Docker build for ESP-IDF v4.4.8
-# docker build -t sle118/squeezelite-esp32-idfv448:4.4.8 .
+# Docker build for release 4.3.5 as of 2023/05/18
+# docker build . --build-arg IDF_CHECKOUT_REF=6d04316cbe4dc35ea7e4885e9821bd9958ac996d -t sle118/squeezelite-esp32-idfv435 
 # Updating the docker image in the repository
-# docker push sle118/squeezelite-esp32-idfv448:4.4.8
+# docker push sle118/squeezelite-esp32-idfv435
 # or to do both:
-# docker build -t sle118/squeezelite-esp32-idfv448:4.4.8 . && docker push sle118/squeezelite-esp32-idfv448:4.4.8
+# docker build . --build-arg IDF_CHECKOUT_REF=6d04316cbe4dc35ea7e4885e9821bd9958ac996d -t sle118/squeezelite-esp32-idfv435 && docker push sle118/squeezelite-esp32-idfv435
 #
 # (windows) To run the image interactive : 
-# docker run --rm -v %cd%:/project -w /project -it sle118/squeezelite-esp32-idfv448:4.4.8
+# docker run --rm -v %cd%:/project -w /project -it sle118/squeezelite-esp32-idfv435
 # (windows powershell)
-# docker run --rm -v ${PWD}:/project -w /project -it sle118/squeezelite-esp32-idfv448:4.4.8
+# docker run --rm -v ${PWD}:/project -w /project -it sle118/squeezelite-esp32-idfv435
 # (linux) To run the image interactive :
-# docker run --rm -v `pwd`:/project -w /project -it sle118/squeezelite-esp32-idfv448:4.4.8
+# docker run --rm -v `pwd`:/project -w /project -it sle118/squeezelite-esp32-idfv435
 # to build the web app inside of the interactive session
 # pushd components/wifi-manager/webapp/ && npm install && npm run-script build && popd
 #
 # to run the docker with netwotrk port published on the host:
 # (windows)
-# docker run --rm -p 5000:5000/tcp -v %cd%:/project -w /project -it sle118/squeezelite-esp32-idfv448:4.4.8
+# docker run --rm -p 5000:5000/tcp -v %cd%:/project -w /project -it sle118/squeezelite-esp32-idfv435
 # (linux)
-# docker run --rm -p 5000:5000/tcp -v `pwd`:/project -w /project -it sle118/squeezelite-esp32-idfv448:4.4.8
+# docker run --rm -p 5000:5000/tcp -v `pwd`:/project -w /project -it sle118/squeezelite-esp32-idfv435
 
 
 ARG IDF_CLONE_URL=https://github.com/espressif/esp-idf.git
-ARG IDF_CLONE_BRANCH_OR_TAG=v4.4.8
-ARG IDF_CHECKOUT_REF=e499576efdb086551abe309a72899302f82077b7
-ARG PUNCOVER_CHECKOUT_REF=1fff5e04fcac4e975846b19677c3e5eb2b520b5a
+ARG IDF_CLONE_BRANCH_OR_TAG=master
+ARG IDF_CHECKOUT_REF=6d04316cbe4dc35ea7e4885e9821bd9958ac996d
 
 ENV IDF_PATH=/opt/esp/idf
 ENV IDF_TOOLS_PATH=/opt/esp
-
-SHELL ["/bin/bash", "--login", "-c"]
 
 # We need libpython2.7 due to GDB tools
 # we also need npm 8 for the webapp to work
@@ -80,40 +78,28 @@ RUN : \
   && python -m pip install --upgrade \
     pip \
     virtualenv \
-  && :
-
-RUN : \
-  && cd /opt \
-  && git clone --depth 1 --branch 0.6.1 https://github.com/HBehrens/puncover.git \
+  && cd /opt \  
+  && git clone https://github.com/HBehrens/puncover.git \
   && cd puncover \
-  && git checkout $PUNCOVER_CHECKOUT_REF \
-  && python -m pip install . \
-  && :
-
-RUN : \
+  && python setup.py -q install \
   && echo IDF_CHECKOUT_REF=$IDF_CHECKOUT_REF IDF_CLONE_BRANCH_OR_TAG=$IDF_CLONE_BRANCH_OR_TAG \
-  && git clone --depth 1 --branch "$IDF_CLONE_BRANCH_OR_TAG" \
-      --recurse-submodules --shallow-submodules \
-      "$IDF_CLONE_URL" "$IDF_PATH" \
+  && git clone --recursive \
+      ${IDF_CLONE_BRANCH_OR_TAG:+-b $IDF_CLONE_BRANCH_OR_TAG} \
+      $IDF_CLONE_URL $IDF_PATH \
 	&& if [ -n "$IDF_CHECKOUT_REF" ]; then \
       cd $IDF_PATH \
   &&  git checkout $IDF_CHECKOUT_REF \
   &&  git submodule update --init --recursive; \
     fi \
   && update-ca-certificates --fresh \
-  && :
-
-# Keep this costly, version-pinned toolchain install in its own layer. Changes to
-# later CI helpers or web tooling can then reuse it from Docker's cache.
-RUN : \
   && $IDF_PATH/tools/idf_tools.py --non-interactive install required \
   && $IDF_PATH/tools/idf_tools.py --non-interactive install cmake \
   && $IDF_PATH/tools/idf_tools.py --non-interactive install-python-env \
   && :
 RUN : \
   echo Installing pygit2  ******************************************************** \
-  && . "$IDF_PATH/export.sh" \
-  && ln -sf "$(command -v python)" /usr/local/bin/python \
+  && . /opt/esp/python_env/idf4.3_py3.8_env/bin/activate \
+  && ln -sf /opt/esp/python_env/idf4.3_py3.8_env/bin/python  /usr/local/bin/python \
   && pip install pygit2 requests \
   && pip show pygit2 \ 
   && python --version \  
@@ -122,14 +108,19 @@ RUN : \
   && rm -rf $IDF_TOOLS_PATH/dist \
   && :
 
-# Let ESP-IDF export.sh provide version-specific tool paths at runtime.
-ENV GCC_TOOLS_BASE="/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch5-8.4.0/xtensa-esp32-elf/bin/xtensa-esp32-elf-"
+COPY docker/patches $IDF_PATH
+
+#set idf environment variabies
+ENV PATH /opt/esp/idf/components/esptool_py/esptool:/opt/esp/idf/components/espcoredump:/opt/esp/idf/components/partition_table:/opt/esp/idf/components/app_update:/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32-elf/bin:/opt/esp/tools/xtensa-esp32s2-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32s2-elf/bin:/opt/esp/tools/xtensa-esp32s3-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32s3-elf/bin:/opt/esp/tools/riscv32-esp-elf/esp-2021r2-patch3-8.4.0/riscv32-esp-elf/bin:/opt/esp/tools/esp32ulp-elf/2.28.51-esp-20191205/esp32ulp-elf-binutils/bin:/opt/esp/tools/esp32s2ulp-elf/2.28.51-esp-20191205/esp32s2ulp-elf-binutils/bin:/opt/esp/tools/cmake/3.16.4/bin:/opt/esp/tools/openocd-esp32/v0.11.0-esp32-20220706/openocd-esp32/bin:/opt/esp/python_env/idf4.3_py3.8_env/bin:/opt/esp/idf/tools:$PATH
+ENV GCC_TOOLS_BASE="/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32-elf/bin/xtensa-esp32-elf-"
 ENV IDF_PATH="/opt/esp/idf"
-ENV IDF_PYTHON_ENV_PATH="/opt/esp/python_env/idf4.4_py3.8_env"
+ENV IDF_PYTHON_ENV_PATH="/opt/esp/python_env/idf4.3_py3.8_env"
 ENV IDF_TOOLS_EXPORT_CMD="/opt/esp/idf/export.sh"
 ENV IDF_TOOLS_INSTALL_CMD="/opt/esp/idf/install.sh"
 ENV IDF_TOOLS_PATH="/opt/esp"
-ENV PATH="$IDF_PYTHON_ENV_PATH:$IDF_PATH/tools:$PATH"
+ENV NODE_PATH="/v8/lib/node_modules"
+ENV NODE_VERSION="8"
+ENV OPENOCD_SCRIPTS="/opt/esp/tools/openocd-esp32/v0.10.0-esp32-20211111/openocd-esp32/share/openocd/scripts"
 # Ccache is installed, enable it by default
 
 # The constraint file has been downloaded and the right Python package versions installed. No need to check and
@@ -161,6 +152,9 @@ RUN : \
 COPY docker/entrypoint.sh /opt/esp/entrypoint.sh
 COPY components/wifi-manager/webapp/package.json /opt
 
+ENV NODE_VERSION 8
+
+SHELL ["/bin/bash", "--login", "-c"]
 # Install nvm with node and npm
 # RUN wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash \
 #     && export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")" \
@@ -183,6 +177,7 @@ RUN : \
   && cd /opt \
   && cat ./package.json | jq '.devDependencies | keys[] as $k | "\($k)@\(.[$k])"' | xargs -t npm install --global \
   && echo installing npm global packages \
+  && npm i -g npm \
   && node --version \
   && npm install -g \  
   && :      
@@ -190,7 +185,8 @@ RUN : \
   && npm install -g html-webpack-plugin 
 
 
-ENV NODE_PATH=/usr/lib/node_modules
+ENV NODE_PATH $NVM_DIR/v$NODE_VERSION/lib/node_modules
+ENV PATH $IDF_PYTHON_ENV_PATH:$NVM_DIR/v$NODE_VERSION/bin:$PATH
 COPY ./docker/build_tools.py /usr/sbin/build_tools.py
 RUN : \
   && echo Changing permissions ********************************************************  \

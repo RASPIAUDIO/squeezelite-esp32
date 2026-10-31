@@ -31,11 +31,21 @@ sure that using rate_delay would fix that
 */
 
 #include "squeezelite.h"
+#if CONFIG_MNCAST_SENDSPIN
+#include "sendspin_sink.h"
+#include "esp_timer.h"
+#endif
 #include "slimproto.h"
 #include "esp_pthread.h"
-#include "driver/i2s.h"
-#include "driver/i2c.h"
+#include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#if CONFIG_MNCAST_S31_COREBOARD
+#include "audio_wire_probe.h"
+#include "esp_private/esp_clk_tree_common.h"
+#include "hal/gpio_ll.h"
+#include "hal/i2s_ll.h"
+#include "soc/gpio_struct.h"
+#endif
 #include "perf_trace.h"
 #include <signal.h>
 #include "adac.h"
@@ -66,8 +76,16 @@ sure that using rate_delay would fix that
  * At least, let's make sure it's not a too small amount of samples so 450*4*2=3600 fits 
  * nicely in one DMA buffer and 2048/450 = 4 buffers + ~1/2 buffer which is acceptable.
  */
+#if CONFIG_MNCAST_SENDSPIN && BYTES_PER_FRAME == 8
+// 512 stereo PCM32 frames occupy 4096 bytes: IDF clamps this to 511
+// frames (4092-byte descriptor limit), breaking FRAME_BLOCK alignment.
+// Preserve total queue capacity while keeping each block descriptor-aligned.
+#define DMA_BUF_FRAMES 256
+#define DMA_BUF_COUNT 24
+#else
 #define DMA_BUF_FRAMES	512
 #define DMA_BUF_COUNT	12
+#endif
 
 #define DMA_BUF_FRAMES_SPDIF	450
 #define DMA_BUF_COUNT_SPDIF     7
@@ -98,7 +116,11 @@ extern struct buffer *streambuf;
 extern struct buffer *outputbuf;
 extern u8_t *silencebuf;
 
-const struct adac_s *dac_set[] = { &dac_tas57xx, &dac_tas5713, &dac_ac101, &dac_wm8978, NULL };
+const struct adac_s *dac_set[] = {
+#if CONFIG_IDF_TARGET_ESP32S31
+    &dac_es8311,
+#endif
+    &dac_tas57xx, &dac_tas5713, &dac_ac101, &dac_wm8978, NULL };
 const struct adac_s *adac = &dac_external;
 
 static log_level loglevel;
@@ -108,9 +130,151 @@ static void (*pseudo_idle_chain)(uint32_t);
 static bool (*slimp_handler_chain)(u8_t *data, int len);
 static bool jack_mutes_amp;
 static bool running, isI2SStarted, ended;
-static i2s_config_t i2s_config;
+#if CONFIG_MNCAST_S31_COREBOARD
+/* Explicit opt-in diagnostic; observes PCM memory, not the physical I2S bus. */
+static bool audio_diag;
+#endif
+
+static i2s_chan_handle_t i2s_tx_handle = NULL;
+typedef struct {
+	uint32_t sample_rate;
+	i2s_data_bit_width_t bits_per_sample;
+	i2s_slot_mode_t channel_format;
+	uint32_t dma_buf_len;
+	uint32_t dma_buf_count;
+	bool use_apll;
+	bool tx_desc_auto_clear;
+	int fixed_mclk;  // Custom field for precise MCLK control
+} i2s_config_compat_t;
+static i2s_config_compat_t i2s_config;
+
+#if CONFIG_MNCAST_S31_COREBOARD
+static unsigned audio_apll_guard_refs;
+static bool audio_apll_fixed;
+static bool audio_external_clock;
+static uint32_t audio_apll_actual;
+
+static void audio_apll_release(void) {
+    while (audio_apll_guard_refs) {
+        esp_clk_tree_enable_src(SOC_MOD_CLK_APLL, false);
+        --audio_apll_guard_refs;
+    }
+    audio_apll_fixed = false;
+}
+
+static bool audio_apll_prepare(uint32_t rate) {
+    uint32_t requested = 125000000;
+    // Diagnostic override is restricted to Wi-Fi-only boots: RGMII requires
+    // APLL=125 MHz. Never retune it underneath an enabled Ethernet driver.
+    char *eth = config_alloc_get_default(NVS_TYPE_STR, "eth_disable", "N", 0);
+    char *apll = config_alloc_get_default(NVS_TYPE_STR, "audio_apll", "125000000", 0);
+    uint32_t candidate = apll ? strtoul(apll, NULL, 10) : 125000000;
+    if (eth && !strcasecmp(eth, "Y")) {
+        if (apll && !strcasecmp(apll, "audio")) {
+            requested = rate && rate % 11025 == 0 ? 90316800 : 98304000;
+        } else if (candidate == 98304000 || candidate == 90316800 || candidate == 122880000) {
+            requested = candidate;
+        }
+    }
+    free(eth);
+    free(apll);
+    if (audio_apll_fixed && audio_apll_actual >= requested - 1000 &&
+        audio_apll_actual <= requested + 1000) return true;
+    // Rate-family changes must happen with TX disabled. Release only our two
+    // guards; the disabled I2S channel keeps its own reference. IDF refuses
+    // retuning if any additional peripheral owns the APLL.
+    if (audio_apll_fixed && isI2SStarted) return false;
+    audio_apll_release();
+    uint32_t actual = 0;
+    esp_err_t err = esp_clk_tree_src_set_freq_hz(SOC_MOD_CLK_APLL, requested, &actual);
+    if ((err != ESP_OK && err != ESP_ERR_INVALID_STATE) ||
+        actual < requested - 1000 || actual > requested + 1000) {
+        LOG_WARN("Cannot reserve APLL requested=%u actual=%u err=%d; using XTAL", requested, actual, err);
+        audio_apll_release();
+        return false;
+    }
+    // Prevent the driver's subsequent clock calculation from retuning APLL.
+    while (audio_apll_guard_refs < 2) {
+        if (esp_clk_tree_enable_src(SOC_MOD_CLK_APLL, true) != ESP_OK) {
+            audio_apll_release();
+            return false;
+        }
+        ++audio_apll_guard_refs;
+    }
+    audio_apll_fixed = true;
+    audio_apll_actual = actual;
+    LOG_INFO("External DAC APLL requested=%u actual=%u Hz; retuning guarded", requested, actual);
+    return true;
+}
+
+static void audio_clock_readback(uint32_t rate) {
+    if (!audio_diag || !audio_apll_fixed) return;
+    // Read-only diagnostics on the pinned S31 SDK; this is a register-derived
+    // clock estimate, not a measurement at the external DAC's pins.
+    uint32_t n, x, y, z, yn1;
+    if (CONFIG_I2S_NUM == 0) {
+        n = HP_SYS_CLKRST.i2s0_tx_ctrl0.reg_i2s0_tx_div_n;
+        x = HP_SYS_CLKRST.i2s0_tx_div_ctrl0.reg_i2s0_tx_div_x;
+        y = HP_SYS_CLKRST.i2s0_tx_div_ctrl0.reg_i2s0_tx_div_y;
+        z = HP_SYS_CLKRST.i2s0_tx_div_ctrl0.reg_i2s0_tx_div_z;
+        yn1 = HP_SYS_CLKRST.i2s0_tx_div_ctrl0.reg_i2s0_tx_div_yn1;
+    } else {
+        n = HP_SYS_CLKRST.i2s1_tx_ctrl0.reg_i2s1_tx_div_n;
+        x = HP_SYS_CLKRST.i2s1_tx_div_ctrl0.reg_i2s1_tx_div_x;
+        y = HP_SYS_CLKRST.i2s1_tx_div_ctrl0.reg_i2s1_tx_div_y;
+        z = HP_SYS_CLKRST.i2s1_tx_div_ctrl0.reg_i2s1_tx_div_z;
+        yn1 = HP_SYS_CLKRST.i2s1_tx_div_ctrl0.reg_i2s1_tx_div_yn1;
+    }
+    uint32_t a = (x + 1) * z + y;
+    double frac = z && a ? (yn1 ? 1.0 - (double)z / a : (double)z / a) : 0.0;
+    uint32_t bdiv = I2S_LL_GET_HW(CONFIG_I2S_NUM)->tx_conf.tx_bck_div_num + 1;
+    double mclk = n ? audio_apll_actual / (n + frac) : 0.0;
+    LOG_INFO("I2S_CLOCK fs_req=%u src=%u n=%u x=%u y=%u z=%u yn1=%u bdiv=%u mclk=%.3f bclk=%.3f fs_calc=%.3f",
+        rate, audio_apll_actual, n, x, y, z, yn1, bdiv, mclk, mclk / bdiv,
+        mclk / bdiv / (2 * i2s_config.bits_per_sample));
+}
+#endif
+
+static i2s_clock_src_t audio_clock_source(bool use_apll, uint32_t rate) {
+#if CONFIG_MNCAST_S31_COREBOARD
+    if (audio_external_clock && audio_apll_prepare(rate)) return I2S_CLK_SRC_APLL;
+    // RGMII owns APLL at 125 MHz on this board. Re-tuning it for 44.1 kHz
+    // audio breaks the Ethernet TX clock (observed during first hardware boot).
+    // Match the independently validated FIP configuration. Fractional XTAL
+    // division has higher MCLK jitter; no clock-quality claim is made here.
+    (void)use_apll;
+    return I2S_CLK_SRC_XTAL;
+#elif SOC_I2S_SUPPORTS_APLL
+    (void)rate;
+    if (use_apll) return I2S_CLK_SRC_APLL;
+#else
+    (void)rate;
+    (void)use_apll;
+#endif
+    return I2S_CLK_SRC_DEFAULT;
+}
+
+static i2s_mclk_multiple_t audio_mclk_multiple(uint32_t rate) {
+#if CONFIG_MNCAST_S31_COREBOARD
+    // Keep the source/MCLK divider comfortably above 2 at high rates.
+    // High-rate operation requires the Espressif 4f9e257 fractional-divider
+    // overflow fix in hal_utils.c. Use >=128fs (BCLK divider >=2 for stereo
+    // 32-bit slots); the earlier 64fs experiment produced acoustic distortion.
+    if (audio_apll_fixed) return rate > 96000 ? I2S_MCLK_MULTIPLE_128 : I2S_MCLK_MULTIPLE_256;
+    // The shared 40 MHz XTAL source needs MCLK below source/2, including
+    // when MCLK is not routed to a pin. 256*96k exceeds that limit.
+    // This also matches dac_es8311's high-rate coefficient selection.
+    if (rate > 48000) return I2S_MCLK_MULTIPLE_128;
+#endif
+    return I2S_MCLK_MULTIPLE_256;
+}
+
 static u8_t *obuf;
 static frames_t oframes;
+#if CONFIG_MNCAST_SENDSPIN
+static frames_t sendspin_last_source_frame;
+static size_t sendspin_dma_frames;
+#endif
 static struct {
 	bool enabled;
 	u8_t *buf;
@@ -128,6 +292,46 @@ static int _i2s_write_frames(frames_t out_frames, bool silence, s32_t gainL, s32
 								s32_t cross_gain_in, s32_t cross_gain_out, ISAMPLE_T **cross_ptr);
 static void output_thread_i2s(void *arg);
 static void i2s_stats(uint32_t now);
+
+#if CONFIG_MNCAST_S31_COREBOARD
+static void probe_pcm(const ISAMPLE_T *samples, frames_t frames) {
+    static uint32_t last_log;
+    uint32_t now = gettime_ms();
+    if (!audio_diag || now - last_log < 250 || !frames) return;
+    last_log = now;
+    uint32_t peak[2] = {0}, crossings = 0, first = 0, last = 0, nonzero = 0;
+    uint32_t low16_nonzero = 0, low8_nonzero = 0;
+    for (frames_t f = 0; f < frames; ++f) {
+        for (unsigned c = 0; c < 2; ++c) {
+            int64_t v = samples[2*f+c];
+            uint32_t magnitude = v < 0 ? -v : v;
+            if (magnitude > peak[c]) peak[c] = magnitude;
+            if (magnitude) ++nonzero;
+#if BYTES_PER_FRAME == 8
+            /* At unity gain a 24-bit source is left aligned: bits 8..15
+             * distinguish it from a 16-bit source padded to 32 bits.
+             * Observe the buffer passed to I2S, not physical wire/DAC ENOB. */
+            if ((uint32_t)samples[2*f+c] & 0xffffu) ++low16_nonzero;
+            if ((uint32_t)samples[2*f+c] & 0xffu) ++low8_nonzero;
+#endif
+        }
+        if (f && samples[2*(f-1)] <= 0 && samples[2*f] > 0) {
+            if (!crossings) first = f;
+            last = f;
+            ++crossings;
+        }
+    }
+    uint32_t milli_hz = crossings > 1 ?
+        (uint64_t)(crossings-1) * output.current_sample_rate * 1000 / (last-first) : 0;
+    LOG_INFO("PCM_PROBE memory frames:%u bits:%u peakL:%lu peakR:%lu nonzero:%lu crossing_Hz:%lu.%03lu PA57:%d",
+        (unsigned)frames, (unsigned)(sizeof(ISAMPLE_T)*8),
+        (unsigned long)peak[0], (unsigned long)peak[1], (unsigned long)nonzero,
+        (unsigned long)(milli_hz/1000), (unsigned long)(milli_hz%1000), gpio_get_level(57));
+    LOG_INFO("PCM_DEPTH memory samples:%u low16_nonzero:%lu low8_nonzero:%lu fs:%u",
+        (unsigned)(frames*2), (unsigned long)low16_nonzero,
+        (unsigned long)low8_nonzero, (unsigned)output.current_sample_rate);
+}
+#endif
 
 static void spdif_convert(ISAMPLE_T *src, size_t frames, u32_t *dst);
 static void (*jack_handler_chain)(bool inserted);
@@ -202,6 +406,254 @@ static void set_amp_gpio(int gpio, char *value) {
 #endif
 
 /****************************************************************************************
+ * I2S API wrapper functions for ESP-IDF 5.x
+ */
+
+typedef struct {
+	int bck_io_num;
+	int ws_io_num;
+	int data_out_num;
+	int data_in_num;
+	int mck_io_num;
+} i2s_pin_config_compat_t;
+
+static esp_err_t i2s_driver_install_compat(const i2s_config_compat_t *config, i2s_pin_config_compat_t *pin_config) {
+	if (i2s_tx_handle != NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	// Configure channel
+	i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_I2S_NUM, I2S_ROLE_MASTER);
+	chan_cfg.dma_desc_num = config->dma_buf_count;
+	chan_cfg.dma_frame_num = config->dma_buf_len;
+	chan_cfg.auto_clear = config->tx_desc_auto_clear;
+
+	esp_err_t ret = i2s_new_channel(&chan_cfg, &i2s_tx_handle, NULL);
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	// Configure standard mode
+	i2s_std_config_t std_cfg = {
+		.clk_cfg = {
+			.sample_rate_hz = config->sample_rate,
+			.clk_src = audio_clock_source(config->use_apll, config->sample_rate),
+			.mclk_multiple = audio_mclk_multiple(config->sample_rate),
+		},
+		.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(config->bits_per_sample, config->channel_format),
+		.gpio_cfg = {
+			.mclk = pin_config->mck_io_num,
+			.bclk = pin_config->bck_io_num,
+			.ws = pin_config->ws_io_num,
+			.dout = pin_config->data_out_num,
+			.din = pin_config->data_in_num,
+			.invert_flags = {
+				.mclk_inv = false,
+				.bclk_inv = false,
+				.ws_inv = false,
+			},
+		},
+	};
+
+	// Handle fixed_mclk if specified
+	if (config->fixed_mclk > 0 && config->use_apll) {
+		// Calculate mclk_multiple from fixed_mclk
+		// fixed_mclk = sample_rate * mclk_multiple
+		uint32_t calculated_multiple = config->fixed_mclk / config->sample_rate;
+		// Find closest standard multiple
+		if (calculated_multiple <= 128) {
+			std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_128;
+		} else if (calculated_multiple <= 192) {
+			std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_192;
+		} else if (calculated_multiple <= 256) {
+			std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+		} else if (calculated_multiple <= 384) {
+			std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+		} else {
+			std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_512;
+		}
+	}
+
+	ret = i2s_channel_init_std_mode(i2s_tx_handle, &std_cfg);
+	if (ret != ESP_OK) {
+		i2s_del_channel(i2s_tx_handle);
+		i2s_tx_handle = NULL;
+		return ret;
+	}
+
+	ret = i2s_channel_enable(i2s_tx_handle);
+	if (ret != ESP_OK) {
+		i2s_del_channel(i2s_tx_handle);
+		i2s_tx_handle = NULL;
+		return ret;
+	}
+
+	return ESP_OK;
+}
+
+static esp_err_t i2s_driver_uninstall_compat(void) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	i2s_channel_disable(i2s_tx_handle);
+	esp_err_t ret = i2s_del_channel(i2s_tx_handle);
+	i2s_tx_handle = NULL;
+	return ret;
+}
+
+static esp_err_t i2s_write_compat(const void *src, size_t size, size_t *bytes_written, TickType_t ticks_to_wait) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+	return i2s_channel_write(i2s_tx_handle, src, size, bytes_written,
+        ticks_to_wait == portMAX_DELAY ? UINT32_MAX : pdTICKS_TO_MS(ticks_to_wait));
+}
+
+static esp_err_t i2s_zero_dma_buffer_compat(void) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+#if CONFIG_IDF_TARGET_ESP32S31
+    i2s_chan_info_t info;
+    esp_err_t err = i2s_channel_get_info(i2s_tx_handle, &info);
+    if (err != ESP_OK) return err;
+    // A flush is an explicit discontinuity. Stop before preloading and clear
+    // the whole ring, not dma_desc_num * 512 bytes (only a quarter at 16-bit).
+    if (info.is_enabled) {
+        err = i2s_channel_disable(i2s_tx_handle);
+        if (err != ESP_OK) return err;
+    }
+    static const uint8_t zeros[512] = {0};
+    size_t remaining = info.total_dma_buf_size;
+    while (remaining) {
+        size_t written = 0;
+        err = i2s_channel_preload_data(i2s_tx_handle, zeros,
+                remaining < sizeof(zeros) ? remaining : sizeof(zeros), &written);
+        if (err != ESP_OK || !written) break;
+        remaining -= written;
+    }
+    if (info.is_enabled) {
+        esp_err_t start_err = i2s_channel_enable(i2s_tx_handle);
+        if (err == ESP_OK) err = start_err;
+    }
+    return err;
+#else
+	// In ESP-IDF 5.x, use preload for disabled channel, write for enabled channel
+	static uint8_t zero_buf[512] = {0};
+	size_t bytes_written;
+	
+	// Try to preload first (works when channel is disabled)
+	esp_err_t ret = i2s_channel_preload_data(i2s_tx_handle, zero_buf, sizeof(zero_buf), &bytes_written);
+	if (ret == ESP_OK) {
+		// Preload succeeded, channel was disabled - preload remaining buffers
+		for (int i = 1; i < i2s_config.dma_buf_count; i++) {
+			i2s_channel_preload_data(i2s_tx_handle, zero_buf, sizeof(zero_buf), &bytes_written);
+		}
+	} else if (ret == ESP_ERR_INVALID_STATE) {
+		// Channel is already enabled, use write instead
+		for (int i = 0; i < i2s_config.dma_buf_count; i++) {
+			i2s_channel_write(i2s_tx_handle, zero_buf, sizeof(zero_buf), &bytes_written, 0);
+		}
+	}
+	return ESP_OK;
+#endif
+}
+
+static esp_err_t i2s_set_sample_rates_compat(uint32_t rate) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	bool restart = isI2SStarted;
+	if (restart) {
+	    adac->power(ADAC_STANDBY);
+	    esp_err_t stop_err = i2s_channel_disable(i2s_tx_handle);
+	    if (stop_err != ESP_OK) return stop_err;
+	    isI2SStarted = false;
+	}
+	// Reconfigure clock only after TX stops, including optional APLL retuning.
+	i2s_std_clk_config_t clk_cfg = {
+		.sample_rate_hz = rate,
+		.clk_src = audio_clock_source(i2s_config.use_apll, rate),
+		.mclk_multiple = audio_mclk_multiple(rate),
+	};
+
+	// Handle fixed_mclk
+	if (i2s_config.fixed_mclk > 0 && i2s_config.use_apll) {
+		uint32_t calculated_multiple = i2s_config.fixed_mclk / rate;
+		if (calculated_multiple <= 128) {
+			clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_128;
+		} else if (calculated_multiple <= 192) {
+			clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_192;
+		} else if (calculated_multiple <= 256) {
+			clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+		} else if (calculated_multiple <= 384) {
+			clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+		} else {
+			clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_512;
+		}
+	}
+
+	esp_err_t err = i2s_channel_reconfig_std_clock(i2s_tx_handle, &clk_cfg);
+	if (err == ESP_OK && !spdif.enabled && adac->samplerate &&
+	    !adac->samplerate(rate, i2s_config.bits_per_sample)) return ESP_FAIL;
+	if (err == ESP_OK && restart) {
+	    err = i2s_channel_enable(i2s_tx_handle);
+	    if (err == ESP_OK) {
+	        isI2SStarted = true;
+	        adac->power(ADAC_ON);
+	    }
+	}
+	if (err == ESP_OK) i2s_config.sample_rate = spdif.enabled ? rate / 2 : rate;
+#if CONFIG_MNCAST_S31_COREBOARD
+    if (err == ESP_OK) audio_clock_readback(rate);
+#endif
+	return err;
+}
+
+static esp_err_t i2s_start_compat(void) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+	return i2s_channel_enable(i2s_tx_handle);
+}
+
+static esp_err_t i2s_stop_compat(void) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_OK;
+	}
+	return i2s_channel_disable(i2s_tx_handle);
+}
+
+// i2s_write_expand compatibility wrapper
+static esp_err_t i2s_write_expand_compat(const void *src, size_t size, size_t src_bits, size_t aim_bits,
+										 size_t *bytes_written, TickType_t ticks_to_wait) {
+	if (i2s_tx_handle == NULL) {
+		return ESP_ERR_INVALID_STATE;
+	}
+	
+	// For now, just use regular write - expansion should be handled by the I2S hardware
+	// or we'd need to implement bit expansion in software
+	// This is a simplified approach; full bit expansion would require buffer allocation
+	return i2s_channel_write(i2s_tx_handle, src, size, bytes_written, ticks_to_wait);
+}
+
+// Macro definitions for compatibility
+#define i2s_driver_install(port, config, queue_size, queue) i2s_driver_install_compat(config, &i2s_dac_pin)
+#define i2s_driver_uninstall(port) i2s_driver_uninstall_compat()
+#define i2s_write(port, src, size, bytes_written, timeout) i2s_write_compat(src, size, bytes_written, timeout)
+#define i2s_write_expand(port, src, size, src_bits, aim_bits, bytes_written, timeout) i2s_write_expand_compat(src, size, src_bits, aim_bits, bytes_written, timeout)
+#define i2s_zero_dma_buffer(port) i2s_zero_dma_buffer_compat()
+#define i2s_set_sample_rates(port, rate) i2s_set_sample_rates_compat(rate)
+#define i2s_start(port) i2s_start_compat()
+#define i2s_stop(port) i2s_stop_compat()
+#define i2s_set_pin(port, pin) ESP_OK  // Pin config handled in install
+
+// Pin config compatibility type
+#define i2s_pin_config_t i2s_pin_config_compat_t
+
+/****************************************************************************************
  * Get inactivity callback
  */
 static uint32_t i2s_idle_callback(void) {
@@ -216,10 +668,8 @@ static void set_i2s_pin(char *config, i2s_pin_config_t *pin_config) {
 	PARSE_PARAM(config, "bck", '=', pin_config->bck_io_num);
 	PARSE_PARAM(config, "ws", '=', pin_config->ws_io_num);
 	PARSE_PARAM(config, "do", '=', pin_config->data_out_num);
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
     pin_config->mck_io_num = strcasestr(config, "mck") ? 0 : -1;
     PARSE_PARAM(config, "mck", '=', pin_config->mck_io_num);   
-#endif    
 }
 
 /* When a panic occurs during playback, the I2S interface can produce a loud noise burst.
@@ -232,11 +682,16 @@ static void set_i2s_pin(char *config, i2s_pin_config_t *pin_config) {
 
 void __real_esp_panic_handler(void*);
 
-void __wrap_esp_panic_handler (void* info) {
+void IRAM_ATTR __wrap_esp_panic_handler (void* info) {
     esp_rom_printf("I2S abort!\r\n");
-    
+#if CONFIG_MNCAST_S31_COREBOARD
+    // Driver disable takes a mutex and waits on the scheduler: neither is safe
+    // in panic context. It hid the original exception behind an LP-WDT reset.
+    // Mute the board amplifier directly, then let IDF print the real fault.
+    gpio_ll_set_level(&GPIO, 57, 0);
+#else
     i2s_stop(CONFIG_I2S_NUM);
-    
+#endif
     /* Call the original panic handler function to finish processing this error */
     __real_esp_panic_handler(info);
 }
@@ -258,6 +713,11 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 	jack_mutes_amp = (strcmp(p,"1") == 0 ||strcasecmp(p,"y") == 0);
 	free(p);
 	
+#if CONFIG_MNCAST_S31_COREBOARD
+    p = config_alloc_get_default(NVS_TYPE_STR, "audio_diag", "n", 0);
+    audio_diag = !strcasecmp(p, "y") || !strcmp(p, "1");
+    free(p);
+#endif
 #if BYTES_PER_FRAME == 8
 	output.format = S32_LE;
 #else
@@ -293,17 +753,14 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
     }
     
 	// common I2S initialization
-	i2s_config.mode = I2S_MODE_MASTER | I2S_MODE_TX;
-	i2s_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-	i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-	// in case of overflow, do not replay old buffer
-	i2s_config.tx_desc_auto_clear = true;		
-#ifndef CONFIG_IDF_TARGET_ESP32S3
-    i2s_config.use_apll = true;
-#endif 
-	i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1; //Interrupt level 1
-    i2s_config.dma_buf_len = DMA_BUF_FRAMES;	
+	i2s_config.sample_rate = output.current_sample_rate;
+	i2s_config.bits_per_sample = I2S_DATA_BIT_WIDTH_16BIT;
+	i2s_config.channel_format = I2S_SLOT_MODE_STEREO;
+	i2s_config.use_apll = true;
+	i2s_config.tx_desc_auto_clear = true;
+	i2s_config.dma_buf_len = DMA_BUF_FRAMES;	
 	i2s_config.dma_buf_count = DMA_BUF_COUNT;
+	i2s_config.fixed_mclk = 0;  // Will be set by DAC if needed
 	
 	if (strcasestr(device, "spdif")) {
 		spdif.enabled = true;	
@@ -318,7 +775,7 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 		}
 									
 		i2s_config.sample_rate = output.current_sample_rate * 2;
-		i2s_config.bits_per_sample = 32;
+		i2s_config.bits_per_sample = I2S_DATA_BIT_WIDTH_32BIT;
 		// Normally counted in frames, but 16 sample are transformed into 32 bits in spdif
 		i2s_config.dma_buf_len = DMA_BUF_FRAMES_SPDIF;	
 		i2s_config.dma_buf_count = DMA_BUF_COUNT_SPDIF;
@@ -337,7 +794,7 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 		LOG_INFO("SPDIF using I2S bck:%d, ws:%d, do:%d", i2s_spdif_pin.bck_io_num, i2s_spdif_pin.ws_io_num, i2s_spdif_pin.data_out_num);
 	} else {
 		i2s_config.sample_rate = output.current_sample_rate;
-		i2s_config.bits_per_sample = BYTES_PER_FRAME * 8 / 2;
+		i2s_config.bits_per_sample = (BYTES_PER_FRAME * 8 / 2) == 16 ? I2S_DATA_BIT_WIDTH_16BIT : I2S_DATA_BIT_WIDTH_32BIT;
 		// Counted in frames (but i2s allocates a buffer <= 4092 bytes)
 		i2s_config.dma_buf_len = DMA_BUF_FRAMES;	
 		i2s_config.dma_buf_count = DMA_BUF_COUNT;
@@ -356,45 +813,25 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 		}	
 
         bool mck_required = false;
+		adac = &dac_external;
 		for (int i = 0; adac == &dac_external && dac_set[i]; i++) if (strcasestr(dac_set[i]->model, model)) adac = dac_set[i];
-		res = adac->init(dac_config, I2C_PORT, &i2s_config, &mck_required) ? ESP_OK : ESP_FAIL;
-        
-#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(4, 4, 0)        
-        int mck_io_num = strcasestr(dac_config, "mck") || mck_required ? 0 : -1;
-        PARSE_PARAM(dac_config, "mck", '=', mck_io_num);
-
-        LOG_INFO("configuring MCLK on GPIO %d", mck_io_num);
-
-        if (mck_io_num == GPIO_NUM_0) {
-            PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
-            WRITE_PERI_REG(PIN_CTRL, CONFIG_I2S_NUM == I2S_NUM_0 ? 0xFFF0 : 0xFFFF);
-        } else if (mck_io_num == GPIO_NUM_1) {
-            PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0TXD_U, FUNC_U0TXD_CLK_OUT3);
-            WRITE_PERI_REG(PIN_CTRL, CONFIG_I2S_NUM == I2S_NUM_0 ? 0xF0F0 : 0xF0FF);
-        } else if (mck_io_num == GPIO_NUM_2) {
-            PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_U0RXD_CLK_OUT2);
-            WRITE_PERI_REG(PIN_CTRL, CONFIG_I2S_NUM == I2S_NUM_0 ? 0xFF00 : 0xFF0F);
-        } else {
-            LOG_WARN("invalid MCK gpio %d", mck_io_num);
-        }
-#else
+#if CONFIG_MNCAST_S31_COREBOARD
+        audio_external_clock = adac == &dac_external;
+#endif
+		res = adac->init(dac_config, I2C_PORT, (i2s_config_param_t *)&i2s_config, &mck_required) ? ESP_OK : ESP_FAIL;
         if (mck_required && i2s_dac_pin.mck_io_num == -1) i2s_dac_pin.mck_io_num = 0;
-        LOG_INFO("configuring MCLK on GPIO %d", i2s_dac_pin.mck_io_num);
-#endif    
+        LOG_INFO("configuring MCLK on GPIO %d", i2s_dac_pin.mck_io_num);    
        
 		res |= i2s_driver_install(CONFIG_I2S_NUM, &i2s_config, 0, NULL);
 		res |= i2s_set_pin(CONFIG_I2S_NUM, &i2s_dac_pin);
         	
 		if (res == ESP_OK && mute_control.gpio >= 0) {
-			gpio_pad_select_gpio(mute_control.gpio);
-			gpio_set_direction(mute_control.gpio, GPIO_MODE_OUTPUT);
-			gpio_set_level(mute_control.gpio, mute_control.active);
-		}		
-				
+			esp_rom_gpio_pad_select_gpio(mute_control.gpio);
+		}
 		LOG_INFO("%s DAC using I2S bck:%d, ws:%d, do:%d, mute:%d:%d (res:%d)", model, i2s_dac_pin.bck_io_num, i2s_dac_pin.ws_io_num, 
-																   i2s_dac_pin.data_out_num, mute_control.gpio, mute_control.active, res);
-	}	
-			
+															   i2s_dac_pin.data_out_num, mute_control.gpio, mute_control.active, res);
+	}
+
 	free(dac_config);
 	free(spdif_config);
 	
@@ -402,10 +839,20 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 		LOG_WARN("no DAC configured");
 		return;
 	}	
+#if CONFIG_MNCAST_SENDSPIN
+    i2s_chan_info_t dma_info = {0};
+    sendspin_dma_frames = dma_buf_frames;
+    if (i2s_channel_get_info(i2s_tx_handle, &dma_info) == ESP_OK) {
+        // IDF can clamp 512 stereo PCM32 frames to 511 per descriptor.
+        size_t dma_bytes_per_frame = spdif.enabled ? 16 : i2s_config.bits_per_sample / 8 * 2;
+        if (dma_bytes_per_frame && dma_info.total_dma_buf_size)
+            sendspin_dma_frames = dma_info.total_dma_buf_size / dma_bytes_per_frame;
+    }
+#endif
 	
 	// turn off GPIO than is not used (SPDIF of DAC DO when shared)
 	if (silent_do >= 0) {
-		gpio_pad_select_gpio(silent_do);
+		esp_rom_gpio_pad_select_gpio(silent_do);
 		gpio_set_direction(silent_do, GPIO_MODE_OUTPUT);
 		gpio_set_level(silent_do, 0);
 	}	
@@ -429,9 +876,24 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 	parse_set_GPIO(set_amp_gpio);
 #endif
 
+#if CONFIG_MNCAST_S31_COREBOARD
+    if (adac != &dac_es8311) {
+        /* The onboard speaker amplifier must remain off when J2 feeds an
+         * external stereo DAC, even if NVS still contains 57=amp. */
+        gpio_pad_select_gpio_x(57);
+        gpio_set_direction_x(57, GPIO_MODE_OUTPUT);
+        gpio_set_level_x(57, 0);
+        if (amp_control.gpio == 57) amp_control.gpio = -1;
+        LOG_INFO("External DAC: stereo preserved, onboard amplifier GPIO57 disabled");
+    }
+#endif
+
 	if (amp_control.gpio != -1) {
 		gpio_pad_select_gpio_x(amp_control.gpio);
 		gpio_set_direction_x(amp_control.gpio, GPIO_MODE_OUTPUT);
+#if CONFIG_MNCAST_S31_COREBOARD
+        if (audio_diag && amp_control.gpio == 57) gpio_input_enable(57);
+#endif
 		gpio_set_level_x(amp_control.gpio, !amp_control.active);
 		LOG_INFO("setting amplifier GPIO %d (active:%d)", amp_control.gpio, amp_control.active);	
 	}	
@@ -453,10 +915,13 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
     i2s_idle_since = pdTICKS_TO_MS(xTaskGetTickCount());    
     services_sleep_setsleeper(i2s_idle_callback);
     
+#if CONFIG_MNCAST_S31_COREBOARD
+    if (adac == &dac_es8311) audio_wire_probe_start();
+#endif
 	// create task as a FreeRTOS task but uses stack in internal RAM
 	{
 		static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-		static EXT_RAM_ATTR StackType_t xStack[OUTPUT_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
+		static EXT_RAM_BSS_ATTR StackType_t xStack[OUTPUT_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
 		output_i2s_task = xTaskCreateStaticPinnedToCore( (TaskFunction_t) output_thread_i2s, "output_i2s", OUTPUT_THREAD_STACK_SIZE, 
 											  NULL, CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 10, xStack, &xTaskBuffer, 0 );
 	}
@@ -471,8 +936,14 @@ void output_close_i2s(void) {
 	UNLOCK;
 	
 	while (!ended) vTaskDelay(20 / portTICK_PERIOD_MS);
-	
+#if CONFIG_MNCAST_S31_COREBOARD
+    audio_wire_probe_stop();
+#endif
 	i2s_driver_uninstall(CONFIG_I2S_NUM);
+#if CONFIG_MNCAST_S31_COREBOARD
+    audio_apll_release();
+    audio_external_clock = false;
+#endif
 	free(obuf);
 	
 	equalizer_close();
@@ -500,6 +971,9 @@ static int _i2s_write_frames(frames_t out_frames, bool silence, s32_t gainL, s32
 		
 		_apply_gain(outputbuf, out_frames, gainL, gainR, flags);
 		memcpy(obuf + oframes * BYTES_PER_FRAME, outputbuf->readp, out_frames * BYTES_PER_FRAME);
+#if CONFIG_MNCAST_SENDSPIN
+        sendspin_last_source_frame = oframes + out_frames;
+#endif
 	} else {
 		memcpy(obuf + oframes * BYTES_PER_FRAME, silencebuf, out_frames * BYTES_PER_FRAME);
 	}
@@ -521,7 +995,7 @@ static void output_thread_i2s(void *arg) {
 	size_t bytes;
 	frames_t iframes = FRAME_BLOCK;
 	uint32_t timer_start = 0;
-	int discard = 0;
+	frames_t discard = 0;
 	uint32_t fullness = gettime_ms();
 	bool synced;
 	output_state state = OUTPUT_OFF - 1;
@@ -561,18 +1035,32 @@ static void output_thread_i2s(void *arg) {
 				adac->power(ADAC_STANDBY);
 			}
 			usleep(100000);
+			fullness = gettime_ms();
 			continue;
 		} else if (output.state == OUTPUT_STOPPED) {
 			synced = false;
 		}
 					
 		oframes = 0;
+#if CONFIG_MNCAST_SENDSPIN
+        sendspin_last_source_frame = 0;
+#endif
 		output.updated = gettime_ms();
 		output.frames_played_dmp = output.frames_played;
 		// try to estimate how much we have consumed from the DMA buffer (calculation is incorrect at the very beginning ...)
-		output.device_frames = dma_buf_frames - ((output.updated - fullness) * output.current_sample_rate) / 1000;
+		// Upstream PR591 (3fbc417): idle gaps must not underflow the DMA
+		// estimate and turn the next start's discard count into billions.
+		uint64_t consumed = ((uint64_t)(output.updated - fullness) * output.current_sample_rate) / 1000;
+		output.device_frames = consumed < dma_buf_frames ? dma_buf_frames - consumed : 0;
         // we'll try to produce iframes if we have any, but we might return less if outpuf does not have enough
 		_output_frames( iframes );
+#if CONFIG_MNCAST_SENDSPIN
+        // frames_played counts source frames, excluding silence synthesized by
+        // the output engine on underrun. Never report that silence as consumed input.
+        uint32_t sendspin_frames = output.external == MN_SENDSPIN_SOURCE_ID ? output.frames_played - output.frames_played_dmp : 0;
+        uint32_t sendspin_epoch = mn_sendspin_output_epoch;
+        uint32_t sendspin_rate = output.current_sample_rate;
+#endif
 		// oframes must be a global updated by the write callback
 		output.frames_in_process = oframes;
               						
@@ -618,8 +1106,13 @@ static void output_thread_i2s(void *arg) {
 				discard = DMA_BUF_COUNT * DMA_BUF_LEN * BYTES_PER_FRAME;
 			*/		
 			}	
-			i2s_config.sample_rate = output.current_sample_rate;
-			i2s_set_sample_rates(CONFIG_I2S_NUM, spdif.enabled ? i2s_config.sample_rate * 2 : i2s_config.sample_rate);
+			esp_err_t rate_err = i2s_set_sample_rates(CONFIG_I2S_NUM,
+                spdif.enabled ? output.current_sample_rate * 2 : output.current_sample_rate);
+			if (rate_err != ESP_OK) {
+			    LOG_ERROR("I2S sample rate change failed: %s", esp_err_to_name(rate_err));
+			    running = false;
+			    break;
+			}
 			i2s_zero_dma_buffer(CONFIG_I2S_NUM);
 
             equalizer_set_samplerate(output.current_sample_rate);
@@ -627,6 +1120,18 @@ static void output_thread_i2s(void *arg) {
 		
 		// run equalizer
 		equalizer_process(obuf, oframes * BYTES_PER_FRAME);
+#if CONFIG_MNCAST_S31_COREBOARD
+        if (!spdif.enabled && adac == &dac_es8311) {
+            /* The board's ES8311 has one DAC. Preserve both source channels
+             * by averaging into both I2S slots, with headroom before summing. */
+            ISAMPLE_T *samples = (ISAMPLE_T *)obuf;
+            for (frames_t f = 0; f < oframes; ++f) {
+                ISAMPLE_T mono = ((int64_t)samples[2*f] + samples[2*f+1]) / 2;
+                samples[2*f] = samples[2*f+1] = mono;
+            }
+        }
+        if (!spdif.enabled) probe_pcm((ISAMPLE_T *)obuf, oframes);
+#endif
 
 		// we assume that here we have been able to entirely fill the DMA buffers
 		if (spdif.enabled) {
@@ -649,6 +1154,31 @@ static void output_thread_i2s(void *arg) {
 		}
 
 		fullness = gettime_ms();
+#if CONFIG_MNCAST_SENDSPIN
+        if (sendspin_frames && bytes == oframes * BYTES_PER_FRAME) {
+            // The blocking write has accepted this block into the DMA queue.
+            // Report its estimated finish, not its enqueue time. Validate the
+            // fixed DMA estimate against a reference player before claiming sync.
+            // Synthetic underrun silence can trail real samples inside this
+            // block. Timestamp the last REAL frame, not the end of that silence.
+            int64_t remaining = (int64_t)sendspin_dma_frames -
+                (oframes - sendspin_last_source_frame);
+            int64_t finish_us = esp_timer_get_time() + remaining * 1000000 / sendspin_rate;
+            static uint32_t diagnostic_epoch;
+            static int64_t diagnostic_finish;
+            static bool diagnostic_full_block;
+            bool full_block = sendspin_frames == oframes;
+            if (diagnostic_epoch == sendspin_epoch && diagnostic_full_block && full_block) {
+                int64_t step = finish_us - diagnostic_finish - (int64_t)oframes * 1000000 / sendspin_rate;
+                if (step > 2000 || step < -2000)
+                    LOG_INFO("Sendspin DMA endpoint step %lld us", (long long)step);
+            }
+            diagnostic_epoch = sendspin_epoch;
+            diagnostic_finish = finish_us;
+            diagnostic_full_block = full_block;
+            mn_sendspin_played(sendspin_epoch, sendspin_frames, finish_us);
+        }
+#endif
 
 		if (bytes != oframes * BYTES_PER_FRAME) {
 			LOG_WARN("I2S DMA Overflow! available bytes: %d, I2S wrote %d bytes", oframes * BYTES_PER_FRAME, bytes);

@@ -2,7 +2,7 @@
 #include <string.h>
 #include "application_name.h"
 #include "esp_err.h"
-#include "esp_app_format.h"
+#include "esp_app_desc.h"
 
 extern esp_err_t process_recovery_ota(const char * bin_url, char * bin_buffer, uint32_t length);
 
@@ -11,6 +11,13 @@ const __attribute__((section(".rodata_desc"))) esp_app_desc_t esp_app_desc = {
     .version = PROJECT_VER,
     .project_name = CONFIG_PROJECT_NAME,
     .idf_ver = IDF_VER,
+#if CONFIG_IDF_TARGET_ESP32S31
+    // Match IDF 6.1's bootloader contract, including the MMU page size.
+    .min_efuse_blk_rev_full = CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL,
+    .max_efuse_blk_rev_full = CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL,
+    .mmu_page_size = 31 - __builtin_clz(CONFIG_MMU_PAGE_SIZE),
+    .spi_flash_mode = CONFIG_ESPTOOLPY_FLASHMODE_VAL,
+#endif
 
 #ifdef CONFIG_BOOTLOADER_APP_SECURE_VERSION
     .secure_version = CONFIG_BOOTLOADER_APP_SECURE_VERSION,

@@ -76,10 +76,7 @@ PlaybackState::PlaybackState(std::shared_ptr<cspot::Context> ctx) {
   addCapability(CapabilityType_kSupportedTypes, -1,
                 std::vector<std::string>(
                     {"audio/track", "audio/episode", "audio/episode+track"}));
-  // however many were actually added: a hardcoded count silently drops the
-  // capabilities past it, which is how kSupportedTypes stopped being sent when
-  // kSupportsPlaylistV2 was inserted above
-  innerFrame.device_state.capabilities_count = capabilityIndex;
+  innerFrame.device_state.capabilities_count = 8;
 }
 
 PlaybackState::~PlaybackState() {

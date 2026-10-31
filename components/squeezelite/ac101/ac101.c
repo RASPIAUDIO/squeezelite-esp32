@@ -28,8 +28,7 @@
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <driver/i2c.h>
-#include <driver/i2s.h>
+#include "driver/i2s_std.h"
 #include "adac.h"
 #include "ac101.h"
 
@@ -48,13 +47,13 @@ static const char TAG[] = "AC101";
         return b;\
     }
 	
-static bool init(char *config, int i2c_port, i2s_config_t *i2s_config, bool *mck);
+static bool init(char *config, int i2c_port, i2s_config_param_t *i2s_config, bool *mck);
 static void speaker(bool active);
 static void headset(bool active);
 static bool volume(unsigned left, unsigned right);
 static void power(adac_power_e mode);
 
-const struct adac_s dac_ac101 = { "AC101", init, adac_deinit, power, speaker, headset, volume };
+const struct adac_s dac_ac101 = { "AC101", init, adac_deinit, power, speaker, headset, volume, NULL };
 
 static void ac101_start(ac_module_t mode);
 static void ac101_stop(void);
@@ -64,11 +63,12 @@ static void ac101_set_spk_volume(uint8_t volume);
 /****************************************************************************************
  * init
  */
-static bool init(char *config, int i2c_port, i2s_config_t *i2s_config, bool *mck) {	 
+static bool init(char *config, int i2c_port, i2s_config_param_t *i2s_config, bool *mck) {	 
 	adac_init(config, i2c_port);
 	if (adac_read_word(AC101_ADDR, CHIP_AUDIO_RS) == 0xffff) {
 		ESP_LOGW(TAG, "No AC101 detected");
-		i2c_driver_delete(i2c_port);
+		// Note: With new i2c_master driver, bus is managed by i2c_bus service
+		// No need to delete driver here
 		return false;		
 	}
 	

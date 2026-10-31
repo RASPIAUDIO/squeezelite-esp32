@@ -132,10 +132,12 @@ std::vector<uint8_t> PlainConnection::sendPrefixPacket(
 }
 
 void PlainConnection::readBlock(const uint8_t* dst, size_t size) {
-  ssize_t n, idx = 0;
+  unsigned int idx = 0;
+  ssize_t n;
   int retries = 0;
 
   while (idx < size) {
+  READ:
     if ((n = recv(this->apSock, (char*)&dst[idx], size - idx, 0)) <= 0) {
       switch (getErrno()) {
         case EAGAIN:
@@ -144,13 +146,13 @@ void PlainConnection::readBlock(const uint8_t* dst, size_t size) {
             CSPOT_LOG(error, "Connection lost, will need to reconnect...");
             throw std::runtime_error("Reconnection required");
           }
-          continue;
+          goto READ;
         case EINTR:
-          continue;
+          break;
         default:
           if (retries++ > 4)
             throw std::runtime_error("Error in read");
-          continue;
+          goto READ;
       }
     }
     idx += n;
@@ -164,6 +166,7 @@ size_t PlainConnection::writeBlock(const std::vector<uint8_t>& data) {
   int retries = 0;
 
   while (idx < data.size()) {
+  WRITE:
     if ((n = send(this->apSock, (char*)&data[idx],
                   data.size() - idx < 64 ? data.size() - idx : 64, 0)) <= 0) {
       switch (getErrno()) {
@@ -172,13 +175,13 @@ size_t PlainConnection::writeBlock(const std::vector<uint8_t>& data) {
           if (timeoutHandler()) {
             throw std::runtime_error("Reconnection required");
           }
-          continue;
+          goto WRITE;
         case EINTR:
-          continue;
+          break;
         default:
           if (retries++ > 4)
             throw std::runtime_error("Error in write");
-          continue;
+          goto WRITE;
       }
     }
     idx += n;

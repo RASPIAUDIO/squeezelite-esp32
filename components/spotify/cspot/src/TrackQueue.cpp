@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "AccessKeyFetcher.h"
+#include "CdnResponse.h"
 #include "BellTask.h"
 #include "CDNAudioFile.h"
 #include "CSpotContext.h"
@@ -124,12 +125,6 @@ QueuedTrack::QueuedTrack(TrackReference& ref,
                          std::shared_ptr<cspot::Context> ctx,
                          uint32_t requestedPosition)
     : requestedPosition(requestedPosition), ctx(ctx) {
-  // A file id alone cannot prove which playback instance a notification is
-  // about (same track queued twice, PREV restart), so every queue entry gets
-  // a process-unique sequence number woven into its identifier
-  static std::atomic<uint32_t> seq(0);
-  instanceSeq = ++seq;
-
   this->ref = ref;
 
   loadedSemaphore = std::make_shared<bell::WrappedSemaphore>();
@@ -242,8 +237,8 @@ void QueuedTrack::stepParseMetadata(Track* pbTrack, Episode* pbEpisode) {
     return;
   }
 
-  // Assign track identifier, unique per queue entry, not just per file
-  identifier = bytesToHexString(fileId) + "#" + std::to_string(instanceSeq);
+  // Assign track identifier
+  identifier = bytesToHexString(fileId);
 
   state = State::KEY_REQUIRED;
 }
@@ -251,28 +246,37 @@ void QueuedTrack::stepParseMetadata(Track* pbTrack, Episode* pbEpisode) {
 void QueuedTrack::stepLoadAudioFile(
     std::mutex& trackListMutex,
     std::shared_ptr<bell::WrappedSemaphore> updateSemaphore) {
-  // Request audio key
+  std::scoped_lock lock(audioStateMutex);
+  if (state != State::KEY_REQUIRED) return;
+  state = State::PENDING_KEY;
+  // A delayed reply must not retain or dereference a cancelled/destroyed track.
+  std::weak_ptr<QueuedTrack> weak = shared_from_this();
   this->pendingAudioKeyRequest = ctx->session->requestAudioKey(
       trackId, fileId,
-      [this, &trackListMutex, updateSemaphore](
+      [weak, updateSemaphore](
           bool success, const std::vector<uint8_t>& audioKey) {
-        std::scoped_lock lock(trackListMutex);
+        auto self = weak.lock();
+        if (!self) return;
+        std::scoped_lock lock(self->audioStateMutex);
+        if (self->state != State::PENDING_KEY) return;
 
-        if (success) {
+        if (success && audioKey.size() == 20) {
           CSPOT_LOG(info, "Got audio key");
-          this->audioKey =
+          self->audioKey =
               std::vector<uint8_t>(audioKey.begin() + 4, audioKey.end());
 
-          state = State::CDN_REQUIRED;
+          self->state = State::CDN_REQUIRED;
         } else {
-          CSPOT_LOG(error, "Failed to get audio key");
-          state = State::FAILED;
-          loadedSemaphore->give();
+          CSPOT_LOG(error, "Audio-key request ended without a key (bounded retries)");
+          self->state = State::FAILED;
+          self->loadedSemaphore->give();
         }
         updateSemaphore->give();
       });
-
-  state = State::PENDING_KEY;
+  if (!pendingAudioKeyRequest) {
+    state = State::FAILED;
+    loadedSemaphore->give();
+  }
 }
 
 void QueuedTrack::stepLoadCDNUrl(const std::string& accessKey) {
@@ -298,27 +302,28 @@ void QueuedTrack::stepLoadCDNUrl(const std::string& accessKey) {
     // Wait for response
     std::string_view result = req->body();
 
-#ifdef BELL_ONLY_CJSON
-    cJSON* jsonResult = cJSON_ParseWithLength(result.data(), result.size());
-    cdnUrl = cJSON_GetArrayItem(cJSON_GetObjectItem(jsonResult, "cdnurl"), 0)
-                 ->valuestring;
-    cJSON_Delete(jsonResult);
-#else
-    auto jsonResult = nlohmann::json::parse(result);
-    cdnUrl = jsonResult["cdnurl"][0];
-#endif
+    cdnUrl = parseCdnUrl(req->statusCode(), result);
 
-    CSPOT_LOG(info, "Received CDN URL, %s", cdnUrl.c_str());
+    CSPOT_LOG(info, "Received CDN URL");
     state = State::READY;
     loadedSemaphore->give();
+  } catch (const std::exception& error) {
+    CSPOT_LOG(error, "Cannot fetch CDN URL: %s", error.what());
+    state = State::FAILED;
+    loadedSemaphore->give();
   } catch (...) {
-    CSPOT_LOG(error, "Cannot fetch CDN URL");
+    CSPOT_LOG(error, "Cannot fetch CDN URL: unknown error");
     state = State::FAILED;
     loadedSemaphore->give();
   }
 }
 
 void QueuedTrack::expire() {
+  std::scoped_lock lock(audioStateMutex);
+  if (pendingAudioKeyRequest) {
+    ctx->session->unregisterAudioKey(pendingAudioKeyRequest);
+    pendingAudioKeyRequest = 0;
+  }
   if (state != State::QUEUED) {
     state = State::FAILED;
     loadedSemaphore->give();
@@ -378,12 +383,10 @@ TrackQueue::TrackQueue(std::shared_ptr<cspot::Context> ctx,
   processSemaphore = std::make_shared<bell::WrappedSemaphore>();
   playableSemaphore = std::make_shared<bell::WrappedSemaphore>();
 
-  // Assign encode callback to track list; the encoder runs on whatever
-  // thread sends a frame, so hand it the list together with its guard
-  pbTracksArg = {&tracksMutex, &currentTracks};
+  // Assign encode callback to track list
   playbackState->innerFrame.state.track.funcs.encode =
       &TrackReference::pbEncodeTrackList;
-  playbackState->innerFrame.state.track.arg = &pbTracksArg;
+  playbackState->innerFrame.state.track.arg = &currentTracks;
   pbTrack = Track_init_zero;
   pbEpisode = Episode_init_zero;
 
@@ -401,9 +404,6 @@ TrackQueue::~TrackQueue() {
 }
 
 TrackInfo TrackQueue::getTrackInfo(std::string_view identifier) {
-  // preloadedTracks can be rebuilt by the mercury thread at any moment
-  std::scoped_lock lock(tracksMutex);
-
   for (auto& track : preloadedTracks) {
     if (track->identifier == identifier)
       return track->trackInfo;
@@ -424,15 +424,13 @@ void TrackQueue::runTask() {
     // Make sure we have the newest access key
     accessKey = accessKeyFetcher->getAccessKey();
 
-    {
-      // currentTracksIndex and preloadedTracks are mutated by other threads
-      // under tracksMutex, read them under it as well
-      std::scoped_lock lock(tracksMutex);
+    int loadedIndex = currentTracksIndex;
 
-      // No tracks loaded yet
-      if (currentTracksIndex < 0) {
-        continue;
-      }
+    // No tracks loaded yet
+    if (loadedIndex < 0) {
+      continue;
+    } else {
+      std::scoped_lock lock(tracksMutex);
 
       trackQueue = preloadedTracks;
     }
@@ -457,8 +455,7 @@ std::shared_ptr<QueuedTrack> TrackQueue::consumeTrack(
     std::shared_ptr<QueuedTrack> prevTrack, int& offset) {
   std::scoped_lock lock(tracksMutex);
 
-  if (currentTracksIndex == -1 || currentTracksIndex >= currentTracks.size() ||
-      preloadedTracks.empty()) {
+  if (currentTracksIndex == -1 || currentTracksIndex >= currentTracks.size()) {
     return nullptr;
   }
 
@@ -508,9 +505,6 @@ void TrackQueue::processTrack(std::shared_ptr<QueuedTrack> track) {
       track->stepLoadCDNUrl(accessKey);
 
       if (track->state == QueuedTrack::State::READY) {
-        // queueNextTrack() mutates preloadedTracks, which other threads
-        // access under tracksMutex; this runs on the queue task
-        std::scoped_lock lock(tracksMutex);
         if (preloadedTracks.size() < MAX_TRACKS_PRELOAD) {
           // Queue a new track to preload
           queueNextTrack(preloadedTracks.size());
@@ -548,13 +542,8 @@ bool TrackQueue::queueNextTrack(int offset, uint32_t positionMs) {
 }
 
 bool TrackQueue::skipTrack(SkipDirection dir, bool expectNotify) {
-  std::scoped_lock lock(tracksMutex);
-
-  return skipTrackUnlocked(dir, expectNotify);
-}
-
-bool TrackQueue::skipTrackUnlocked(SkipDirection dir, bool expectNotify) {
   bool skipped = true;
+  std::scoped_lock lock(tracksMutex);
 
   if (dir == SkipDirection::PREV) {
     uint64_t position =
@@ -602,54 +591,6 @@ bool TrackQueue::skipTrackUnlocked(SkipDirection dir, bool expectNotify) {
   return skipped;
 }
 
-TrackQueue::Reached TrackQueue::notifyTrackReached(
-    std::string_view identifier, std::shared_ptr<QueuedTrack>& current) {
-  std::scoped_lock lock(tracksMutex);
-
-  if (currentTracksIndex == -1 || currentTracksIndex >= currentTracks.size() ||
-      preloadedTracks.empty()) {
-    return Reached::IGNORED;
-  }
-
-  // Validate the entire path before changing the queue. A decoder can skip
-  // entries without advancing the track that is currently audible.
-  size_t advances = notifyPending ? 0 : 1;
-
-  if (!identifier.empty()) {
-    // Start at the expected entry. Only abandoned entries may be bypassed.
-    while (advances < preloadedTracks.size() &&
-           preloadedTracks[advances]->identifier != identifier &&
-           preloadedTracks[advances]->abandonned) {
-      ++advances;
-    }
-
-    if (advances >= preloadedTracks.size() ||
-        advances >= currentTracks.size() - currentTracksIndex ||
-        preloadedTracks[advances]->identifier != identifier) {
-      CSPOT_LOG(info, "unexpected notification for %s while at %s => ignored",
-                std::string(identifier).c_str(),
-                preloadedTracks[0]->identifier.c_str());
-      return Reached::IGNORED;
-    }
-  }
-
-  for (size_t i = 0; i < advances; ++i) {
-    skipTrackUnlocked(SkipDirection::NEXT, false);
-  }
-
-  // With an empty identifier, preserve the legacy end-of-queue behavior.
-  if (preloadedTracks.empty()) {
-    return Reached::IGNORED;
-  }
-
-  current = preloadedTracks[0];
-  if (notifyPending) {
-    notifyPending = false;
-    return Reached::CONSUMED_PENDING;
-  }
-  return Reached::ADVANCED;
-}
-
 bool TrackQueue::hasTracks() {
   std::scoped_lock lock(tracksMutex);
 
@@ -682,7 +623,7 @@ bool TrackQueue::updateTracks(uint32_t requestedPosition, bool initial) {
     notifyPending = true;
 
     playableSemaphore->give();
-  } else if (!preloadedTracks.empty() && preloadedTracks[0]->loading) {
+  } else if (preloadedTracks[0]->loading) {
     // try to not re-load track if we are still loading it
 
     // remove everything except first track

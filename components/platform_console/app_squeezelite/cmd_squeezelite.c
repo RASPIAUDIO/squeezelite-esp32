@@ -11,6 +11,7 @@
 #include "platform_esp32.h"
 #include "platform_config.h"
 #include "esp_app_format.h"
+#include "esp_app_desc.h"
 #include "tools.h"
 #include "messaging.h"
 
@@ -24,6 +25,13 @@ const __attribute__((section(".rodata_desc"))) esp_app_desc_t esp_app_desc = {
     .version = PROJECT_VER,
     .project_name = CONFIG_PROJECT_NAME,
     .idf_ver = IDF_VER,
+#if CONFIG_IDF_TARGET_ESP32S31
+    // Match IDF 6.1's bootloader contract, including the MMU page size.
+    .min_efuse_blk_rev_full = CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL,
+    .max_efuse_blk_rev_full = CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL,
+    .mmu_page_size = 31 - __builtin_clz(CONFIG_MMU_PAGE_SIZE),
+    .spi_flash_mode = CONFIG_ESPTOOLPY_FLASHMODE_VAL,
+#endif
 
 #ifdef CONFIG_BOOTLOADER_APP_SECURE_VERSION
     .secure_version = CONFIG_BOOTLOADER_APP_SECURE_VERSION,
@@ -85,8 +93,6 @@ static void squeezelite_thread(void *arg){
         wait_for_commit();
         cmd_send_messaging("cfg-audio-tmpl",MESSAGING_ERROR,"Rebooting in %d sec\n", wait);
         vTaskDelay( pdMS_TO_TICKS(wait * 1000));
-        ESP_LOGW(TAG, "Deliberate Squeezelite restart; resetting boot-loop counter");
-        halSTORAGE_RebootCounterUpdate(0);
         esp_restart();
     } else {
 		cmd_send_messaging("cfg-audio-tmpl",MESSAGING_ERROR,"Correct command line and reboot\n");
@@ -101,7 +107,7 @@ static void squeezelite_thread(void *arg){
 
 static int launchsqueezelite(int argc, char **argv) {
 	static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-	static EXT_RAM_ATTR StackType_t xStack[SQUEEZELITE_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
+	static EXT_RAM_BSS_ATTR StackType_t xStack[SQUEEZELITE_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
 	static bool isRunning = false;
 
 	if (isRunning) {

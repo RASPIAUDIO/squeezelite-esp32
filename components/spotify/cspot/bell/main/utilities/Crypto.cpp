@@ -1,5 +1,7 @@
 #include "Crypto.h"
 
+#if !CONFIG_IDF_TARGET_ESP32S31
+
 #include <mbedtls/base64.h>    // for mbedtls_base64_encode, mbedtls_base64_...
 #include <mbedtls/bignum.h>    // for mbedtls_mpi_free, mbedtls_mpi_init
 #include <mbedtls/ctr_drbg.h>  // for mbedtls_ctr_drbg_free, mbedtls_ctr_drb...
@@ -237,3 +239,4 @@ std::vector<uint8_t> CryptoMbedTLS::generateVectorWithRandomData(
 
   return randomVector;
 }
+#endif

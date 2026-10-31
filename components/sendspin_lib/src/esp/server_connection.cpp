@@ -1,0 +1,389 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "server_connection.h"
+
+#include "lwip/sockets.h"  // for setsockopt, IPPROTO_TCP, NODELAY
+#include "platform/compiler.h"
+#include "platform/logging.h"
+#include "platform/memory.h"
+#include "platform/time.h"
+#include "platform/types.h"
+#include "protocol_messages.h"
+#include "sendspin/types.h"
+#include "ws_server.h"
+#include <esp_err.h>
+
+#include <cstring>
+#include <string>
+#include <utility>
+
+namespace sendspin {
+
+static const char* const TAG = "sendspin.server_connection";
+
+// ============================================================================
+// Static helpers
+// ============================================================================
+
+/// @brief Holds the originating connection and payload data for an async text send
+///
+/// `conn` is a weak_ptr to the connection that queued the work, not a raw `(server, sockfd)` pair.
+/// The worker resolves it with `conn.lock()`: a recycled sockfd can therefore never redirect the
+/// frame onto a different connection, and a destroyed connection yields a null lock (a clean
+/// no-op) rather than a use-after-free.
+///
+/// Block layout: one block of `sizeof(AsyncRespArg) + len` bytes, the struct placement-new'd at
+/// its start and `payload` pointing at the byte immediately following it. The struct is not POD
+/// (it holds a weak_ptr and a std::function hook), so the tail cannot be a flexible array member;
+/// `payload` stays a plain pointer into that same block instead. A lent frame (send_lent_frame())
+/// takes a block of `sizeof(AsyncRespArg)` from the lent pool, with `payload` pointing into its
+/// outbound ring item. Release it only through release_async_resp_arg(), which also frees the
+/// payload or returns the item.
+struct AsyncRespArg {
+    std::weak_ptr<SendspinServerConnection> conn;
+    /// Pools the block came from (the lent pool when `ring` is set), or nullptr for a heap block.
+    SendBlockPools* pools{nullptr};
+    /// For a lent frame, the ring `item` goes back to; nullptr for a copied one.
+    OutboundRing* ring{nullptr};
+    /// For a lent frame, the outbound ring item `payload` points into.
+    void* item{nullptr};
+    uint8_t* payload{nullptr};
+    size_t len{0};
+    /// Frame type (HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY) the worker sends this as.
+    httpd_ws_type_t type{HTTPD_WS_TYPE_TEXT};
+    /// Run immediately before the write, if set.
+    NoiseTransport::FrameWriteHook before_write;
+};
+
+static_assert(SEND_BLOCK_SIZE - sizeof(AsyncRespArg) >= 256,
+              "SEND_BLOCK_SIZE must leave room for the steady-state sends");
+static_assert(sizeof(AsyncRespArg) <= LENT_BLOCK_SIZE, "LENT_BLOCK_SIZE must hold an AsyncRespArg");
+
+/// @brief Destroys `resp_arg`, returns a lent frame's item to its ring, and returns the block to
+/// the pool or heap it came from
+static void release_async_resp_arg(AsyncRespArg* resp_arg) {
+    SendBlockPools* pools = resp_arg->pools;
+    OutboundRing* ring = resp_arg->ring;
+    void* item = resp_arg->item;
+    resp_arg->~AsyncRespArg();
+    if (ring != nullptr) {
+        // The block goes first: returning the item can wake a producer waiting for ring space,
+        // and its next send must find a free block or it fails after the encrypt.
+        pools->lent.release(resp_arg);
+        ring->return_item(item);
+    } else if (pools != nullptr) {
+        pools->copied.release(resp_arg);
+    } else {
+        platform_free(resp_arg);
+    }
+}
+
+void SendspinServerConnection::reclaim_discarded_sends(SendBlockPools& pools) {
+    // Every claimed block holds a constructed AsyncRespArg: a block is claimed and constructed in
+    // one send call on the protocol task, and nothing else touches it, with the protocol task
+    // joined and the httpd task stopped.
+    pools.copied.for_each_claimed(
+        [](void* block) { static_cast<AsyncRespArg*>(block)->~AsyncRespArg(); });
+    pools.lent.for_each_claimed([](void* block) {
+        auto* resp_arg = static_cast<AsyncRespArg*>(block);
+        OutboundRing* ring = resp_arg->ring;
+        void* item = resp_arg->item;
+        resp_arg->~AsyncRespArg();
+        ring->return_item(item);
+    });
+    pools.copied.reset();
+    pools.lent.reset();
+}
+
+// ============================================================================
+// SendspinConnection interface implementation
+// ============================================================================
+
+SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd,
+                                                   SendBlockPools& send_pools)
+    : server_(server), send_pools_(&send_pools), sockfd_(sockfd) {
+    // Disabling Nagle's algorithm significantly improves the time syncing accuracy
+    int nodelay = 1;
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
+        SS_LOGW(TAG, "Failed to turn on TCP_NODELAY, syncing may be inaccurate");
+    }
+}
+
+void SendspinServerConnection::start() {
+    // Time filter is initialized by the hub when it sets up the connection.
+}
+
+void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason) {
+    if (!this->is_connected()) {
+        return;
+    }
+
+    // The goodbye is queued to the httpd worker and the close requested right behind it, whether
+    // or not the queueing succeeded. httpd_queue_work() and httpd_sess_trigger_close() both post
+    // to httpd's one control socket, which it serves in order, so the queued goodbye is written
+    // before the session closes (and before a later httpd_stop() shuts the server down). The
+    // close does not mark the connection closed (only close_callback() does, once httpd has
+    // closed the session), so async_send_frame()'s is_connected() check still passes.
+    this->send_goodbye_reason(reason);
+    this->trigger_close();
+}
+
+void SendspinServerConnection::close_transport_now() {
+    // trigger_close() -> httpd_sess_trigger_close() is already async/non-blocking (the same
+    // primitive disconnect() closes with), so it is safe from any thread. The resulting close
+    // notification (close_callback() in ws_server.cpp) reaches notify_transport_closed().
+    this->trigger_close();
+}
+
+bool SendspinServerConnection::is_connected() const {
+    return this->sockfd_ >= 0 && !this->closed_.load(std::memory_order_acquire);
+}
+
+SsErr SendspinServerConnection::send_text_message(const std::string& message) {
+    return this->queue_async_send(reinterpret_cast<const uint8_t*>(message.data()), message.size(),
+                                  HTTPD_WS_TYPE_TEXT, nullptr);
+}
+
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len) {
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, nullptr);
+}
+
+SsErr SendspinServerConnection::send_transport_frame(
+    const uint8_t* data, size_t len, const NoiseTransport::FrameWriteHook& before_write) {
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, before_write);
+}
+
+SsErr SendspinServerConnection::send_lent_frame(OutboundRing& ring, void* item, size_t len) {
+    if (!this->is_connected()) {
+        ring.return_item(item);
+        return SsErr::INVALID_STATE;
+    }
+
+    void* block = this->send_pools_->lent.try_acquire(sizeof(AsyncRespArg));
+    if (block == nullptr) {
+        SS_LOGW(TAG, "Lent send blocks exhausted after the encrypt; closing the connection");
+        ring.return_item(item);
+        return SsErr::NO_MEM;
+    }
+
+    auto* resp_arg = new (block) AsyncRespArg();
+    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->pools = this->send_pools_;
+    resp_arg->ring = &ring;
+    resp_arg->item = item;
+    resp_arg->payload = outbound_item_message(item);
+    resp_arg->len = len;
+    resp_arg->type = HTTPD_WS_TYPE_BINARY;
+
+    if (httpd_queue_work(this->server_, async_send_frame, resp_arg) != ESP_OK) {
+        SS_LOGE(TAG, "httpd_queue_work failed for a lent binary send!");
+        release_async_resp_arg(resp_arg);
+        return SsErr::FAIL;
+    }
+    return SsErr::OK;
+}
+
+SsErr SendspinServerConnection::queue_async_send(
+    const uint8_t* data, size_t len, httpd_ws_type_t type,
+    const NoiseTransport::FrameWriteHook& before_write) {
+    const bool is_text = (type == HTTPD_WS_TYPE_TEXT);
+
+    if (!this->is_connected()) {
+        return SsErr::INVALID_STATE;
+    }
+
+    const size_t block_size = sizeof(AsyncRespArg) + len;
+    SendBlockPools* pools = this->send_pools_;
+    void* block = pools->copied.try_acquire(block_size);
+    if (block == nullptr) {
+        if (block_size <= SendBlockPool::block_size()) {
+            SS_LOGD(TAG, "Send pool exhausted, allocating %zu bytes", block_size);
+        }
+        pools = nullptr;
+        block = platform_malloc(block_size);
+    }
+    if (block == nullptr) {
+        if (is_text) {
+            SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
+        } else {
+            SS_LOGE(TAG, "Failed to allocate AsyncRespArg for binary send");
+        }
+        return SsErr::NO_MEM;
+    }
+
+    auto* resp_arg = new (block) AsyncRespArg();
+
+    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->pools = pools;
+    resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
+    resp_arg->len = len;
+    resp_arg->type = type;
+    resp_arg->before_write = before_write;
+
+    std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(data), len);
+
+    if (httpd_queue_work(this->server_, async_send_frame, resp_arg) != ESP_OK) {
+        if (is_text) {
+            SS_LOGE(TAG, "httpd_queue_work failed!");
+        } else {
+            SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
+        }
+        release_async_resp_arg(resp_arg);
+        return SsErr::FAIL;
+    }
+    return SsErr::OK;
+}
+
+void SendspinServerConnection::trigger_close() {
+    // Gate on is_connected(): once close_callback has marked this connection closed, httpd may
+    // recycle the fd onto a freshly-accepted session, and closing by the stale fd would kill the
+    // wrong peer. A residual instruction-scale TOCTOU remains (the session could close between
+    // this check and the call below); eliminating it entirely would need an identity check on
+    // the httpd task itself, which is not worth the extra queue hop for a close-time race.
+    // Idempotent: httpd_sess_trigger_close() queues a close against the session slot, so a second
+    // one queued before the first runs could close a session accepted onto that slot meanwhile.
+    if (!this->is_connected() || this->close_triggered_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    httpd_sess_trigger_close(this->server_, this->sockfd_);
+}
+
+SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, SendspinWsServer* server) {
+    // The connection was delivered (and wired to the inbound ring) from the upgrade GET before any
+    // frame can arrive; a frame on a never-delivered or released connection is dropped by the
+    // inbound routing (begin_inbound_message()).
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+
+    // First call with max_len = 0 to get the frame length
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        SS_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
+        return ret;
+    }
+
+    const bool continuation = ws_pkt.type == HTTPD_WS_TYPE_CONTINUE;
+    if (!continuation && ws_pkt.type != HTTPD_WS_TYPE_TEXT && ws_pkt.type != HTTPD_WS_TYPE_BINARY) {
+        // Control frames (ping, pong, close): not handled here
+        return ESP_OK;
+    }
+    const bool is_text = ws_pkt.type == HTTPD_WS_TYPE_TEXT;
+
+    if (!continuation && ws_pkt.final) {
+        // A single-frame message, the only kind a conforming peer sends: received straight into
+        // its destination, a ring item once the connection is admitted.
+        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text);
+        if (target.route == InboundRoute::CLOSE) {
+            return ESP_FAIL;
+        }
+        if (target.route == InboundRoute::DROP) {
+            return SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
+        }
+        ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
+        this->end_inbound_message(ret == ESP_OK, platform_time_us());
+        return ret;
+    }
+
+    // A frame of a multi-frame message (the rare path; see begin_inbound_fragment()).
+    const InboundTarget target = this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text);
+    if (target.route == InboundRoute::CLOSE) {
+        return ESP_FAIL;
+    }
+    if (target.route == InboundRoute::DROP) {
+        ret = SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
+        this->end_inbound_fragment(0, ws_pkt.final, platform_time_us());
+        return ret;
+    }
+    ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
+    if (ret != ESP_OK) {
+        // httpd closes the session over the error; nothing assembled so far is published.
+        return ret;
+    }
+    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final, platform_time_us());
+    return ESP_OK;
+}
+
+esp_err_t SendspinServerConnection::receive_frame_payload(httpd_req_t* req,
+                                                          httpd_ws_frame_t& ws_pkt, uint8_t* dest) {
+    // A zero-length frame has nothing to read, and a second httpd_ws_recv_frame() on a zero
+    // length would parse the next frame's header instead.
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+    // Point httpd directly at the destination so it writes there without an intermediate copy.
+    ws_pkt.payload = dest;
+    const esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+    if (ret != ESP_OK) {
+        SS_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
+    }
+    return ret;
+}
+
+esp_err_t SendspinServerConnection::discard_frame_payload(httpd_req_t* req,
+                                                          httpd_ws_frame_t& ws_pkt,
+                                                          SendspinWsServer* server) {
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+    // httpd hands a frame's payload over only whole (httpd_ws_recv_frame() needs max_len >= the
+    // frame length, httpd_ws.c), so a dropped message still needs room for its frame. The buffer
+    // holds the longest message a conforming server sends a live connection (see
+    // SendspinWsServer::set_discard_capacity()). The frames dropped here are a detached
+    // connection's, sent while it is torn down, so a longer one closes the connection instead.
+    if (server == nullptr || ws_pkt.len > server->discard_capacity()) {
+        SS_LOGW(TAG, "No room to drain a dropped %zu-byte frame; closing", ws_pkt.len);
+        return ESP_FAIL;
+    }
+    uint8_t* scratch = server->discard_buffer();
+    if (scratch == nullptr) {
+        SS_LOGE(TAG, "No %zu-byte buffer to discard a frame into; closing",
+                server->discard_capacity());
+        return ESP_FAIL;
+    }
+    return SendspinServerConnection::receive_frame_payload(req, ws_pkt, scratch);
+}
+
+void SendspinServerConnection::async_send_frame(void* arg) {
+    auto* resp_arg = static_cast<AsyncRespArg*>(arg);
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+
+    ws_pkt.payload = resp_arg->payload;
+    ws_pkt.len = resp_arg->len;
+    ws_pkt.type = resp_arg->type;
+
+    // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
+    // work (or null if it has been destroyed), so a recycled sockfd can never redirect the frame
+    // onto a different connection; a frame whose connection is gone or closed is dropped.
+    auto conn = resp_arg->conn.lock();
+    if (conn && conn->is_connected()) {
+        if (resp_arg->before_write) {
+            resp_arg->before_write();
+        }
+        if (httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt) != ESP_OK) {
+            // An encrypted frame's send nonce is spent, so the peer can authenticate no later
+            // frame (NoiseTransport::is_send_desynced()); the close reaches the protocol task
+            // through close_callback.
+            SS_LOGW(TAG, "Async frame send failed; closing the connection");
+            conn->trigger_close();
+        }
+    }
+
+    // payload lives in resp_arg's own block or its lent item (see AsyncRespArg), so this releases
+    // it too.
+    release_async_resp_arg(resp_arg);
+}
+
+}  // namespace sendspin

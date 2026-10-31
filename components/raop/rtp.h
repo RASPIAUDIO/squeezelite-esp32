@@ -10,7 +10,7 @@ typedef struct {
 } rtp_resp_t;
 
 rtp_resp_t 			rtp_init(struct in_addr host, int latency,
-							char *aeskey, char *aesiv, char *fmtpstr,
+							char *aeskey, char *aesiv, char *fmtpstr, bool pcm,
 							short unsigned pCtrlPort, short unsigned pTimingPort,
 							uint8_t *buffer, size_t size, 
 							raop_cmd_cb_t cmd_cb, raop_data_cb_t data_cb);

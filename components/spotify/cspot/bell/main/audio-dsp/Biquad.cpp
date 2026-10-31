@@ -423,7 +423,7 @@ std::unique_ptr<StreamInfo> Biquad::process(
   auto input = stream->data[this->channel];
   auto numSamples = stream->numSamples;
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && defined(__XTENSA__)
   dsps_biquad_f32_ae32(input, input, numSamples, coeffs, w);
 #else
   // Apply the set coefficients

@@ -10,19 +10,32 @@
  */
 
 #include "freertos/FreeRTOS.h"
-#include "driver/i2s.h"
-#include "driver/i2c.h"
+#include "driver/i2s_std.h"
+#include "esp_err.h"
 
 typedef enum { ADAC_ON = 0, ADAC_STANDBY, ADAC_OFF } adac_power_e;
 
+// ESP-IDF 5.x config structure
+typedef struct {
+	uint32_t sample_rate;
+	i2s_data_bit_width_t bits_per_sample;
+	i2s_slot_mode_t channel_format;
+	uint32_t dma_buf_len;
+	uint32_t dma_buf_count;
+	bool use_apll;
+	bool tx_desc_auto_clear;
+	int fixed_mclk;  // Custom field for precise MCLK control
+} i2s_config_param_t;
+
 struct adac_s {
 	char *model;
-	bool (*init)(char *config, int i2c_port_num, i2s_config_t *i2s_config, bool *mck);
+	bool (*init)(char *config, int i2c_port_num, i2s_config_param_t *i2s_config, bool *mck);
 	void (*deinit)(void);
 	void (*power)(adac_power_e mode);
 	void (*speaker)(bool active);
 	void (*headset)(bool active);
 	bool (*volume)(unsigned left, unsigned right);
+	bool (*samplerate)(uint32_t rate, uint8_t bits);
 };
 
 extern const struct adac_s dac_tas57xx;
@@ -30,6 +43,9 @@ extern const struct adac_s dac_tas5713;
 extern const struct adac_s dac_ac101;
 extern const struct adac_s dac_wm8978;
 extern const struct adac_s dac_external;
+#if CONFIG_IDF_TARGET_ESP32S31
+extern const struct adac_s dac_es8311;
+#endif
 
 int 		adac_init(char *config, int i2c_port);
 void		adac_deinit(void);

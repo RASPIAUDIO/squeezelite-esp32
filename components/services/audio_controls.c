@@ -69,12 +69,12 @@ static const char * actrls_action_s[ ] = { EP(ACTRLS_POWER),EP(ACTRLS_VOLUP),EP(
 static const char * TAG = "audio controls";
 static actrls_config_t *json_config;
 cJSON * control_profiles = NULL;
-static EXT_RAM_ATTR actrls_t default_controls, current_controls;
+static EXT_RAM_BSS_ATTR actrls_t default_controls, current_controls;
 static actrls_hook_t *default_hook, *current_hook;
 static bool default_raw_controls, current_raw_controls;
 static actrls_ir_handler_t *default_ir_handler, *current_ir_handler;
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
 	bool long_state;
 	bool volume_lock;
 	TimerHandle_t timer;
@@ -146,7 +146,7 @@ esp_err_t actrls_init(const char *profile_name) {
 		if ((p = strcasestr(config, "knobonly"))) {
 			p = strchr(p, '=');
 			int double_press = p ? atoi(p + 1) : 350;
-			rotary.timer = xTimerCreate("knobTimer", double_press / portTICK_RATE_MS, pdFALSE, NULL, rotary_timer);
+			rotary.timer = xTimerCreate("knobTimer", double_press / portTICK_PERIOD_MS, pdFALSE, NULL, rotary_timer);
 			longpress = 500;
 			ESP_LOGI(TAG, "single knob navigation %d", double_press);
 		} else {
@@ -269,7 +269,7 @@ static void control_rotary_handler(void *client, rotary_event_e event, bool long
 				// need to add a left button the first time
 				if (rotary.left_count == 1) (*current_controls[KNOB_LEFT])(true);
 			}
-			xTimerStart(rotary.timer, 20 / portTICK_RATE_MS);
+			xTimerStart(rotary.timer, 20 / portTICK_PERIOD_MS);
 			rotary.left_count++;
 		}
 		else if (rotary.long_state) action = ACTRLS_PREV;
@@ -295,7 +295,7 @@ static void control_rotary_handler(void *client, rotary_event_e event, bool long
 				action = BCTRLS_LEFT;
 				xTimerStop(rotary.timer, 0);
 			} 
-			else xTimerStart(rotary.timer, 20 / portTICK_RATE_MS);
+			else xTimerStart(rotary.timer, 20 / portTICK_PERIOD_MS);
 			rotary.click_pending = !rotary.click_pending;
 		} 
 		else if (long_press) rotary.long_state = !rotary.long_state;

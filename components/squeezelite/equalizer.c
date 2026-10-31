@@ -15,10 +15,11 @@
 #include "esp_equalizer.h"
 
 #define EQ_BANDS 10
+#define EQ_SUPPORTED (BYTES_PER_FRAME == 4 || CONFIG_IDF_TARGET_ESP32S31)
 
 static log_level loglevel = lINFO;
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
 	void *handle;
     float loudness, volume;
     uint32_t samplerate;
@@ -65,21 +66,23 @@ static const float loudness_envelope_coefficients[EQ_BANDS][POLYNOME_COUNT] = {
  * calculate loudness gains
  */
 static void calculate_loudness(void) {
-    char trace[EQ_BANDS * 5 + 1];
+    char trace[EQ_BANDS * 16 + 1] = {0};
     size_t n = 0;
-    
 	for (int i = 0; i < EQ_BANDS; i++) {
-        equalizer.loudness_gain[i] = 0;
+		// Recompute from this volume, independently of previous volume changes.
+		equalizer.loudness_gain[i] = 0;
 		for (int j = 0; j < POLYNOME_COUNT && equalizer.loudness != 0; j++) {
 			equalizer.loudness_gain[i] +=
 				loudness_envelope_coefficients[i][j] * pow(equalizer.volume, j);
 		}
 		equalizer.loudness_gain[i] *= equalizer.loudness / 2;
-        int bytes = snprintf(trace + n, sizeof(trace) - n, "%.2g,", equalizer.loudness_gain[i]);
-        if (bytes > 0) n += min((size_t)bytes, sizeof(trace)-n-1);
 	}
-    
-    if (n && trace[n-1] == ',') trace[n-1] = '\0'; 
+    for (int i = 0; i < EQ_BANDS; i++) {
+        int written = snprintf(trace + n, sizeof(trace) - n, "%s%.2g",
+                               i ? "," : "", equalizer.loudness_gain[i]);
+        if (written < 0 || (size_t) written >= sizeof(trace) - n) break;
+        n += written;
+    }
     LOG_INFO("loudness %s", trace);    
 }
 
@@ -119,7 +122,7 @@ void equalizer_close(void) {
  * change sample rate
  */
 void equalizer_set_samplerate(uint32_t samplerate) {
-#if BYTES_PER_FRAME == 4
+#if EQ_SUPPORTED
     if (equalizer.samplerate != samplerate) equalizer_close();
     equalizer.samplerate = samplerate;
     equalizer.update = true;
@@ -134,17 +137,20 @@ void equalizer_set_samplerate(uint32_t samplerate) {
  * get volume update and recalculate loudness according to
  */
 void equalizer_set_volume(unsigned left, unsigned right) {
-#if BYTES_PER_FRAME == 4
+#if EQ_SUPPORTED
     float volume = (left + right) / 2;
     // do classic dB conversion and scale it 0..100
 	if (volume) volume = log2(volume);
 	volume = volume / 16.0 * 100.0;
     
     // LMS has the bad habit to send multiple volume commands
-    if (volume != equalizer.volume && equalizer.loudness) {
+    if (volume != equalizer.volume) {
         equalizer.volume = volume;
-        calculate_loudness();
-        equalizer.update = true;
+        // Keep the current volume even while disabled, for later activation.
+        if (equalizer.loudness) {
+            calculate_loudness();
+            equalizer.update = true;
+        }
     }
 #endif
 }
@@ -153,7 +159,7 @@ void equalizer_set_volume(unsigned left, unsigned right) {
  * change gains from LMS
  */
 void equalizer_set_gain(int8_t *gain) {
-#if BYTES_PER_FRAME == 4
+#if EQ_SUPPORTED
     char config[EQ_BANDS * 4 + 1] = { };
 	int n = 0;
     
@@ -177,7 +183,7 @@ void equalizer_set_gain(int8_t *gain) {
  * change loudness from LMS
  */
 void equalizer_set_loudness(uint8_t loudness) {
-#if BYTES_PER_FRAME == 4
+#if EQ_SUPPORTED
     char p[4];
     itoa(loudness, p, 10);
     config_set_value(NVS_TYPE_STR, "loudness", p);
@@ -199,17 +205,27 @@ void equalizer_set_loudness(uint8_t loudness) {
  * process equalizer
  */
 void equalizer_process(uint8_t *buf, uint32_t bytes) {
-#if BYTES_PER_FRAME == 4    
+#if EQ_SUPPORTED
 	// don't want to process with output locked, so take the small risk to miss one parametric update
 	if (equalizer.update) {
         equalizer.update = false;
 
+#if CONFIG_IDF_TARGET_ESP32S31
+        if (equalizer.samplerate < 8000 || equalizer.samplerate > (BYTES_PER_FRAME == 8 ? 192000 : 96000)) {
+            LOG_WARN("S31 equalizer sample rate unsupported: %u", equalizer.samplerate);
+            return;
+        }
+        if (!equalizer.handle) equalizer.handle = esp_equalizer_init_bits(
+            2, equalizer.samplerate, EQ_BANDS, 0, BYTES_PER_FRAME * 4);
+        if (!equalizer.handle) {
+#else
         if (equalizer.samplerate != 11025 && equalizer.samplerate != 22050 && equalizer.samplerate != 44100 && equalizer.samplerate != 48000) {
             LOG_WARN("equalizer only supports 11025, 22050, 44100 and 48000 sample rates, not %u", equalizer.samplerate);
             return;
         }
 
         if (!equalizer.handle && ((equalizer.handle = esp_equalizer_init(2, equalizer.samplerate, EQ_BANDS, 0)) == NULL)) {
+#endif
             LOG_WARN("can't init equalizer");
             return;
         }
@@ -224,7 +240,8 @@ void equalizer_process(uint8_t *buf, uint32_t bytes) {
 
 		// at the end do not activate equalizer if all gain are 0
 		if (!active) equalizer_close();
-		LOG_INFO("equalizer %s", active ? "actived" : "deactivated");
+		LOG_INFO("equalizer %s: %u bits at %u Hz", active ? "actived" : "deactivated",
+                 BYTES_PER_FRAME * 4, equalizer.samplerate);
 	}
 
 	if (equalizer.handle) {

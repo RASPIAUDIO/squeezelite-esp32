@@ -44,6 +44,8 @@ extern "C" {
 #define ESP_LOGV_LOC(t,str, ...)  ESP_LOGV(t, "%s(%d): " str, __FUNCTION__, __LINE__, ##__VA_ARGS__)
 
 
+esp_err_t sendspin_page_handler(httpd_req_t *req);
+esp_err_t sendspin_api_handler(httpd_req_t *req);
 esp_err_t root_get_handler(httpd_req_t *req);
 esp_err_t resource_filehandler(httpd_req_t *req);
 

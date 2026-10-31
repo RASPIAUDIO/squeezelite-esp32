@@ -70,8 +70,7 @@ struct flac {
 	);
 	FLAC__bool (* FLAC__stream_decoder_process_single)(FLAC__StreamDecoder *decoder);
 	FLAC__StreamDecoderState (* FLAC__stream_decoder_get_state)(const FLAC__StreamDecoder *decoder);
-    FLAC__bool (*FLAC__stream_decoder_set_decode_chained_stream)(FLAC__StreamDecoder* decoder, FLAC__bool allow);
-    FLAC__bool (*FLAC__stream_decoder_finish_link)(FLAC__StreamDecoder* decoder);
+    FLAC__bool (*FLAC__stream_decoder_set_ogg_chaining)(FLAC__StreamDecoder* decoder, FLAC__bool allow);
 #endif
 };
 
@@ -258,7 +257,7 @@ static void flac_open(u8_t sample_size, u8_t sample_rate, u8_t channels, u8_t en
 	
 	if ( f->container == 'o' ) {
 		LOG_INFO("ogg/flac container - using init_ogg_stream");
-        FLAC(f, stream_decoder_set_decode_chained_stream, f->decoder, true);
+        FLAC(f, stream_decoder_set_ogg_chaining, f->decoder, true);
 		FLAC(f, stream_decoder_init_ogg_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, NULL, &error_cb, NULL);
 	} else {
 		FLAC(f, stream_decoder_init_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, NULL, &error_cb, NULL);
@@ -271,15 +270,7 @@ static decode_state flac_decode(void) {
 	
 	if (!ok && state != FLAC__STREAM_DECODER_END_OF_STREAM) {
 		LOG_INFO("flac error: %s", FLAC_A(f, StreamDecoderStateString)[state]);
-	}
-    
-    if (state == FLAC__STREAM_DECODER_END_OF_LINK) {
-        if (!FLAC(f, stream_decoder_finish_link, f->decoder)) {
-			LOG_INFO("flac error: could not finish chained link");
-			return DECODE_ERROR;
-		}
-		return DECODE_RUNNING;
-	}
+	};
 	
 	if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
 		return DECODE_COMPLETE;
@@ -310,8 +301,6 @@ static bool load_flac() {
 	f->FLAC__stream_decoder_process_single = dlsym(handle, "FLAC__stream_decoder_process_single");
 	f->FLAC__stream_decoder_get_state = dlsym(handle, "FLAC__stream_decoder_get_state");
     f->FLAC__stream_decoder_set_ogg_chaining = dlsym(handle, "FLAC__stream_decoder_set_ogg_chaining");
-    f->FLAC__stream_decoder_set_decode_chained_stream = dlsym(gf.handle, "FLAC__stream_decoder_set_decode_chained_stream");
-    f->FLAC__stream_decoder_finish_link = dlsym(handle, "FLAC__stream_decoder_finish_link");
 
 	if ((err = dlerror()) != NULL) {
 		LOG_INFO("dlerror: %s", err);		
@@ -329,7 +318,13 @@ struct codec *register_flac(void) {
 		'f',          // id
 		"ogf,flc",        // types
 		16384,        // min read
+#if CONFIG_MNCAST_S31_COREBOARD
+        65535 * BYTES_PER_FRAME, // Largest legal FLAC block, expanded stereo PCM.
+        // write_cb holds outputbuf's lock for the whole block. Underestimating
+        // this reservation can spin forever with f==0 and prevent consumption.
+#else
 		204800,       // min space
+#endif
 		flac_open,    // open
 		flac_close,   // close
 		flac_decode,  // decode

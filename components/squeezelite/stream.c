@@ -59,9 +59,9 @@ is enough and much faster than a mutex
 static bool polling;
 static sockfd fd;
 
-struct EXT_RAM_ATTR streamstate stream;
+struct EXT_RAM_BSS_ATTR streamstate stream;
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
     bool flac;
     u64_t serial;
 	enum { OGG_OFF, OGG_SYNC, OGG_HEADER, OGG_SEGMENTS, OGG_PAGE } state;
@@ -82,14 +82,6 @@ static EXT_RAM_ATTR struct {
 static SSL_CTX *SSLctx;
 SSL *ssl;
 #endif
-
-static inline u32_t read_le32(const void *src) {
-    const u8_t *p = src;
-    return (u32_t)p[0]
-         | (u32_t)p[1] << 8
-         | (u32_t)p[2] << 16
-         | (u32_t)p[3] << 24;
-}
 
 #if !USE_SSL
 #define _recv(ssl, fc, buf, n, opt) recv(fd, buf, n, opt)
@@ -226,6 +218,7 @@ static void stream_ogg(size_t n) {
 				ogg.match = 0;
 			} else {
                 if (!ogg.match) LOG_INFO("OggS not at expected position %zu/%zu", pos, n);
+                LOG_INFO("OggS not at expected position %zu/%zu", pos, n);
 				return;
 			}
 			break;
@@ -275,8 +268,8 @@ static void stream_ogg(size_t n) {
 			if (ofs) {			
 				// u32:len,char[]:vendorId, u32:N, N x (u32:len,char[]:comment)
 				char* p = (char*) ogg.data + ofs;
-				p += read_le32(p) + 4;
-				u32_t count = read_le32(p);
+				p += *p + 4;
+				u32_t count = *p;
 				p += 4;
 
 				// LMS metadata format for Ogg is "Ogg", N x (u16:len,char[]:comment)
@@ -284,12 +277,12 @@ static void stream_ogg(size_t n) {
 				stream.header_len = 3;
 
 				for (u32_t len; count--; p += len) {
-					len = read_le32(p);
+					len = *p;
 					p += 4;
 
 					// only report what we use and don't overflow (network byte order)
 					if (!strncasecmp(p, "TITLE=", 6) || !strncasecmp(p, "ARTIST=", 7) || !strncasecmp(p, "ALBUM=", 6)) {
-						if (stream.header_len + len + 2 > MAX_HEADER) break;
+						if (stream.header_len + len > MAX_HEADER) break;
 						stream.header[stream.header_len++] = len >> 8;
 						stream.header[stream.header_len++] = len;
 						memcpy(stream.header + stream.header_len, p, len);
@@ -318,7 +311,7 @@ static void stream_ogg(size_t n) {
 	}
 }
 
-static void *stream_thread() {
+static void *stream_thread(void *arg) {
 
 	while (running) {
 

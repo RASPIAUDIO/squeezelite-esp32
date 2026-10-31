@@ -25,7 +25,7 @@ static void bt_app_task_handler(void *arg);
 static bool bt_app_send_msg(bt_app_msg_t *msg);
 static void bt_app_work_dispatched(bt_app_msg_t *msg);
 
-static xQueueHandle s_bt_app_task_queue;
+static QueueHandle_t s_bt_app_task_queue;
 static bool running;
 
 bool bt_app_work_dispatch(bt_app_cb_t p_cback, uint16_t event, void *p_params, int param_len, bt_app_copy_cb_t p_copy_cback)
@@ -60,7 +60,7 @@ static bool bt_app_send_msg(bt_app_msg_t *msg)
         return false;
     }
 
-    if (xQueueSend(s_bt_app_task_queue, msg, 10 / portTICK_RATE_MS) != pdTRUE) {
+    if (xQueueSend(s_bt_app_task_queue, msg, 10 / portTICK_PERIOD_MS) != pdTRUE) {
     	ESP_LOGE(TAG,"%s xQueue send failed", __func__);
         return false;
     }
@@ -94,7 +94,16 @@ static void bt_app_task_handler(void *arg)
             goto exit;
         }
 
-        if ((err = esp_bluedroid_init()) != ESP_OK) {
+#if CONFIG_IDF_TARGET_ESP32S31
+        // IDF 6 configures SSP at runtime; CONFIG_BT_SSP_ENABLED no longer
+        // exists. Keep the host mode and the GAP handlers in agreement.
+        esp_bluedroid_config_t host_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+        host_cfg.ssp_en = true;
+        err = esp_bluedroid_init_with_cfg(&host_cfg);
+#else
+        err = esp_bluedroid_init();
+#endif
+        if (err != ESP_OK) {
             ESP_LOGE(TAG, "%s initialize bluedroid failed: %s\n", __func__, esp_err_to_name(err));
             goto exit;
         }
@@ -108,10 +117,15 @@ static void bt_app_task_handler(void *arg)
 	/* Bluetooth device name, connection mode and profile set up */
 	bt_app_work_dispatch((bt_av_hdl_stack_evt_t*) arg, BT_APP_EVT_STACK_UP, NULL, 0, NULL);
 	
-#if (CONFIG_BT_SSP_ENABLED)
+#if CONFIG_IDF_TARGET_ESP32S31 || CONFIG_BT_SSP_ENABLED
     /* Set default parameters for Secure Simple Pairing */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+#if CONFIG_IDF_TARGET_ESP32S31
+    // This speaker has neither a display nor a passkey keyboard.
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+#else
     esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
+#endif
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
 #endif
 	
@@ -119,14 +133,16 @@ static void bt_app_task_handler(void *arg)
      * Set default parameters for Legacy Pairing
      * Use variable pin, input pin code when pairing
      */
+#if !CONFIG_IDF_TARGET_ESP32S31
     esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
     esp_bt_pin_code_t pin_code;
     esp_bt_gap_set_pin(pin_type, 0, pin_code);
+#endif
 	
 	running = true;
 	
 	while (running) {
-        if (pdTRUE == xQueueReceive(s_bt_app_task_queue, &msg, (portTickType)portMAX_DELAY)) {
+        if (pdTRUE == xQueueReceive(s_bt_app_task_queue, &msg, (TickType_t)portMAX_DELAY)) {
         	ESP_LOGV(TAG,"%s, sig 0x%x, 0x%x", __func__, msg.sig, msg.event);
 			
             switch (msg.sig) {

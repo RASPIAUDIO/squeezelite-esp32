@@ -1,4 +1,5 @@
 #include "TrackPlayer.h"
+#include <chrono>
 
 #include <mutex>        // for mutex, scoped_lock
 #include <string>       // for string
@@ -116,8 +117,14 @@ void TrackPlayer::runTask() {
   int trackOffset = 0;
   bool eof = false;
   bool endOfQueueReached = false;
+  bool loadFailed = false;
 
   while (isRunning) {
+    if (loadFailed && !pendingReset) {
+      // A refused key must not trigger a request storm through the playlist.
+      this->trackQueue->playableSemaphore->twait(100);
+      continue;
+    }
     // Ensure we even have any tracks to play
     if (!this->trackQueue->hasTracks() ||
         (!pendingReset && endOfQueueReached && trackQueue->isFinished())) {
@@ -127,6 +134,7 @@ void TrackPlayer::runTask() {
 
     // Last track was interrupted, reset to default
     if (pendingReset) {
+      loadFailed = false;
       track = nullptr;
       pendingReset = false;
       inFuture = false;
@@ -159,12 +167,23 @@ void TrackPlayer::runTask() {
     inFuture = trackOffset > 0;
 
     if (track->state != QueuedTrack::State::READY) {
-      track->loadedSemaphore->twait(5000);
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(45);
+      while (isRunning && !pendingReset &&
+             track->state != QueuedTrack::State::READY &&
+             track->state != QueuedTrack::State::FAILED &&
+             std::chrono::steady_clock::now() < deadline) {
+        track->loadedSemaphore->twait(100);
+      }
+      if (!isRunning || pendingReset) {
+        track->expire();
+        continue;
+      }
 
       if (track->state != QueuedTrack::State::READY) {
-        CSPOT_LOG(error, "Track failed to load, skipping it");
-        track->abandonned = true;
-        this->eofCallback();
+        track->expire();
+        CSPOT_LOG(error, "Track failed to load; waiting for a new playback command");
+        loadFailed = true;
         continue;
       }
     }
@@ -175,15 +194,12 @@ void TrackPlayer::runTask() {
 
     {
       std::scoped_lock lock(playbackMutex);
-      try {
-        currentTrackStream = track->getAudioFile();
-        currentTrackStream->openStream();
-      } catch (const std::exception& e) {
-        CSPOT_LOG(error, "Failed to open audio stream: %s", e.what());
-        currentSongPlaying = false;
-        continue;
-      }
-     
+
+      currentTrackStream = track->getAudioFile();
+
+      // Open the stream
+      currentTrackStream->openStream();
+
       if (pendingReset || !currentSongPlaying) {
         continue;
       }

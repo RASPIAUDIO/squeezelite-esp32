@@ -13,9 +13,11 @@
 #include "pthread.h"
 #include "esp_pthread.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "monitor.h"
 #include "platform_config.h"
 #include "messaging.h"
@@ -54,9 +56,11 @@ void get_mac(u8_t mac[]) {
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
 }
 
+#if !CONFIG_IDF_TARGET_ESP32S31
 _sig_func_ptr signal(int sig, _sig_func_ptr func) {
 	return NULL;
 }
+#endif
 
 void em_logprint(const char *fmt, ...) {
     va_list args;
@@ -75,9 +79,34 @@ int	pthread_create_name(pthread_t *thread, _CONST pthread_attr_t  *attr,
 				   void *(*start_routine)( void * ), void *arg, char *name) {
 	esp_pthread_cfg_t cfg = esp_pthread_get_default_config(); 
 	cfg.thread_name = name; 
-	cfg.inherit_cfg = true; 
+	cfg.inherit_cfg = true;
+	
+	// Get stack size from attr if provided
+	size_t stack_size = 0;
+	if (attr) {
+		pthread_attr_getstacksize(attr, &stack_size);
+	}
+	
+	size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t spiram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+	
+	ESP_LOGI(TAG, "Creating thread '%s' (stack: %zu), heap internal: %zu, SPIRAM: %zu",
+			 name, stack_size, internal_free, spiram_free);
+	
+	// Use SPIRAM for thread stacks since internal RAM is fragmented
+	// This requires CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+	cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+	
 	esp_pthread_set_cfg(&cfg); 
-	return pthread_create(thread, attr, start_routine, arg);
+	int ret = pthread_create(thread, attr, start_routine, arg);
+	
+	if (ret != 0) {
+		ESP_LOGE(TAG, "Failed to create thread '%s'! error=%d, heap internal: %zu, SPIRAM: %zu",
+				 name, ret, heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+				 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+	}
+	
+	return ret;
 }
 
 uint32_t _gettime_ms_(void) {

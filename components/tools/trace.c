@@ -3,7 +3,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include "esp_log.h"
-#include "freertos/xtensa_api.h"
+#ifdef __XTENSA__
+#include "xtensa_api.h"
+#endif
 #include "freertos/FreeRTOSConfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -23,7 +25,7 @@ static const char TAG[] = "TRACE";
 //     SLIST_ENTRY(mem_usage_trace_for_thread) next;
 // } mem_usage_trace_for_thread_t;
 
-// static EXT_RAM_ATTR SLIST_HEAD(memtrace, mem_usage_trace_for_thread) s_memtrace;
+// static EXT_RAM_BSS_ATTR SLIST_HEAD(memtrace, mem_usage_trace_for_thread) s_memtrace;
 
 // mem_usage_trace_for_thread_t* memtrace_get_thread_entry(TaskHandle_t task)  {
 //     if(!task) {

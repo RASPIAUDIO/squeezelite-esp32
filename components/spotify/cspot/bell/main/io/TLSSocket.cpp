@@ -1,5 +1,59 @@
 #include "TLSSocket.h"
 
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "esp_crt_bundle.h"
+#include <stdexcept>
+
+bell::TLSSocket::TLSSocket() = default;
+
+void bell::TLSSocket::open(const std::string& host, uint16_t port) {
+  close();
+  tls = esp_tls_init();
+  if (!tls) throw std::runtime_error("esp_tls_init failed");
+  esp_tls_cfg_t cfg = {};
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.timeout_ms = 15000;
+  // ESP-TLS supplies PSA-backed TLS, hostname and CA verification on IDF 6.
+  if (esp_tls_conn_new_sync(host.c_str(), host.size(), port, &cfg, tls) != 1 ||
+      esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK) {
+    esp_tls_conn_destroy(tls);
+    tls = nullptr;
+    fd = -1;
+    throw std::runtime_error("Verified ESP-TLS connection failed");
+  }
+  isClosed = false;
+}
+
+size_t bell::TLSSocket::read(uint8_t *buf, size_t len) {
+  if (!tls) throw std::runtime_error("TLS socket is closed");
+  ssize_t result = esp_tls_conn_read(tls, buf, len);
+  if (result < 0) throw std::runtime_error("TLS read failed or timed out");
+  return static_cast<size_t>(result);
+}
+
+size_t bell::TLSSocket::write(uint8_t *buf, size_t len) {
+  if (!tls) throw std::runtime_error("TLS socket is closed");
+  ssize_t result = esp_tls_conn_write(tls, buf, len);
+  if (result < 0) throw std::runtime_error("TLS write failed or timed out");
+  return static_cast<size_t>(result);
+}
+
+size_t bell::TLSSocket::poll() {
+  if (!tls) return 0;
+  ssize_t count = esp_tls_get_bytes_avail(tls);
+  return count > 0 ? static_cast<size_t>(count) : 0;
+}
+
+bool bell::TLSSocket::isOpen() { return !isClosed; }
+void bell::TLSSocket::close() {
+  if (tls) esp_tls_conn_destroy(tls);
+  tls = nullptr;
+  fd = -1;
+  isClosed = true;
+}
+
+#else
+
 #include <mbedtls/ctr_drbg.h>     // for mbedtls_ctr_drbg_free, mbedtls_ctr_...
 #include <mbedtls/entropy.h>      // for mbedtls_entropy_free, mbedtls_entro...
 #include <mbedtls/net_sockets.h>  // for mbedtls_net_connect, mbedtls_net_free
@@ -102,3 +156,4 @@ void bell::TLSSocket::close() {
     this->isClosed = true;
   }
 }
+#endif

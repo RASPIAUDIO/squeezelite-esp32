@@ -1,4 +1,20 @@
 #include "X509Bundle.h"
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "esp_crt_bundle.h"
+#include <stdexcept>
+
+// Use the SDK-maintained bundle verifier, rather than MbedTLS 3 private fields.
+// The S31 TLSSocket attaches this bundle directly through ESP-TLS.
+void bell::X509Bundle::init(const uint8_t *, size_t) {}
+bool bell::X509Bundle::shouldVerify() { return true; }
+void bell::X509Bundle::attach(mbedtls_ssl_config *conf) {
+  if (esp_crt_bundle_attach(conf) != 0)
+    throw std::runtime_error("ESP certificate bundle attachment failed");
+}
+#else
 
 #include <mbedtls/md.h>    // for mbedtls_md, mbedtls_md_get_size
 #include <mbedtls/pk.h>    // for mbedtls_pk_can_do, mbedtls_pk_pa...
@@ -213,3 +229,4 @@ void bell::X509Bundle::attach(mbedtls_ssl_config* conf) {
 bool bell::X509Bundle::shouldVerify() {
   return s_should_verify_certs;
 }
+#endif

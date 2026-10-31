@@ -19,7 +19,7 @@
 #include "gds.h"
 #include "gds_private.h"
 
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#if !SOC_LEDC_SUPPORT_HS_MODE
 #define LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
 #else
 #define LEDC_SPEED_MODE LEDC_HIGH_SPEED_MODE

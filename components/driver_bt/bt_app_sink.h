@@ -22,6 +22,8 @@ typedef void (*bt_data_cb_t)(const uint8_t *data, uint32_t len);
  * @brief     init sink mode (need to be provided)
  */
 void bt_sink_init(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb);
+/* PCM32 callback receives interleaved signed stereo, bytes in len. */
+void bt_sink_init_with_pcm32(bt_cmd_vcb_t cmd_cb, bt_data_cb_t data_cb, bt_data_cb_t data32_cb);
 
 /**
  * @brief     deinit sink mode (need to be provided)

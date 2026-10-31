@@ -11,6 +11,7 @@
 #include "network_wifi.h"
 
 #include "dns_server.h"
+#include "display.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +26,7 @@
 
 #include "esp_event.h"
 #include "esp_ota_ops.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "lwip/api.h"
@@ -45,10 +47,10 @@
 
 static const char TAG[]="network_handlers";
 
-EXT_RAM_ATTR static state_t network_states[TOTAL_NM_STATE];
-EXT_RAM_ATTR static state_t Wifi_Active_State[TOTAL_WIFI_ACTIVE_STATE];
-EXT_RAM_ATTR static state_t Eth_Active_State[TOTAL_ETH_ACTIVE_STATE];
-EXT_RAM_ATTR static state_t Wifi_Configuring_State[TOTAL_WIFI_CONFIGURING_STATE];
+EXT_RAM_BSS_ATTR static state_t network_states[TOTAL_NM_STATE];
+EXT_RAM_BSS_ATTR static state_t Wifi_Active_State[TOTAL_WIFI_ACTIVE_STATE];
+EXT_RAM_BSS_ATTR static state_t Eth_Active_State[TOTAL_ETH_ACTIVE_STATE];
+EXT_RAM_BSS_ATTR static state_t Wifi_Configuring_State[TOTAL_WIFI_CONFIGURING_STATE];
 
 static void network_interface_coexistence(state_machine_t* state_machine);
 static state_machine_result_t local_traverse_state(state_machine_t* const state_machine,
@@ -385,8 +387,17 @@ static state_machine_result_t NETWORK_ETH_ACTIVE_STATE_handler(state_machine_t* 
             //result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_INITIALIZING_STATE],__FUNCTION__);
             break;
         case EN_SCAN:
-            ESP_LOGW(TAG,"Wifi  scan cannot be executed in this state");
-            network_wifi_built_known_ap_list();
+            // Provisioning scans also work on an Ethernet-first boot. Starting
+            // STA does not connect it or replace the active Ethernet route.
+            if (!nm->wifi_netif) {
+                nm->wifi_netif = network_wifi_get_interface();
+                if (!nm->wifi_netif) nm->wifi_netif = network_wifi_start();
+            }
+            network_wifi_start_scan();
+            result = EVENT_HANDLED;
+            break;
+        case EN_SCAN_DONE:
+            wifi_scan_done();
             result = EVENT_HANDLED;
             break;
         case EN_DELETE: {
@@ -417,6 +428,9 @@ static state_machine_result_t NETWORK_ETH_ACTIVE_STATE_exit_handler(state_machin
 static state_machine_result_t ETH_CONNECTING_NEW_STATE_entry_handler(state_machine_t* const State_Machine) {
     network_t* const nm = (network_t *)State_Machine;
     network_handler_entry_print(State_Machine,true);
+    // USB provisioning may be requested on an Ethernet-first boot, before
+    // the station interface has ever been created. Keep the Ethernet link.
+    if (!nm->wifi_netif) nm->wifi_netif = network_wifi_start();
     network_start_stop_dhcp_client(nm->wifi_netif, true);
     network_wifi_connect(nm->event_parameters->ssid,nm->event_parameters->password);
     FREE_AND_NULL(nm->event_parameters->ssid);
@@ -431,7 +445,7 @@ static state_machine_result_t ETH_CONNECTING_NEW_STATE_handler(state_machine_t* 
     state_machine_result_t result = EVENT_HANDLED;
     switch (State_Machine->Event) {
         case EN_GOT_IP:
-            result= local_traverse_state(State_Machine, &network_states[WIFI_CONNECTED_STATE],__FUNCTION__);
+            result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_CONNECTED_STATE],__FUNCTION__);
             break;
         case EN_LOST_CONNECTION:
             network_status_update_ip_info(UPDATE_FAILED_ATTEMPT);
@@ -619,7 +633,20 @@ static state_machine_result_t NETWORK_WIFI_CONFIGURING_ACTIVE_STATE_entry_handle
     network_handler_entry_print(State_Machine,true);
     network_t* const nm = (network_t *)State_Machine;
     nm->wifi_ap_netif = network_wifi_config_ap();
-    dns_server_start(nm->wifi_ap_netif);
+    bool setup_enabled = network_wifi_setup_enabled();
+    if (setup_enabled) dns_server_start(nm->wifi_ap_netif);
+    wifi_config_t ap;
+    esp_netif_ip_info_t info;
+    if (setup_enabled && esp_wifi_get_config(WIFI_IF_AP, &ap) == ESP_OK &&
+        esp_netif_get_ip_info(nm->wifi_ap_netif, &info) == ESP_OK && info.ip.addr &&
+        !network_is_interface_connected(nm->eth_netif)) {
+        char ssid[33] = {0}, password[65] = {0}, ip[16];
+        memcpy(ssid, ap.ap.ssid, sizeof(ap.ap.ssid));
+        memcpy(password, ap.ap.password, sizeof(ap.ap.password));
+        snprintf(ip,sizeof(ip),IPSTR,IP2STR(&info.ip));
+        displayer_wifi_setup(ssid,password,ip,ap.ap.authmode == WIFI_AUTH_OPEN);
+        memset(password,0,sizeof(password));
+    }
     network_wifi_start_scan();
     network_handler_entry_print(State_Machine,false);
     return EVENT_HANDLED;
@@ -647,6 +674,7 @@ static state_machine_result_t NETWORK_WIFI_CONFIGURING_ACTIVE_STATE_handler(stat
             ESP_LOGW(TAG, "Ethernet link up in wifi mode");
             break;
         case EN_ETH_GOT_IP:
+            displayer_wifi_setup(NULL,NULL,NULL,false);
             network_interface_coexistence(State_Machine);
             break;
         default:
@@ -657,6 +685,7 @@ static state_machine_result_t NETWORK_WIFI_CONFIGURING_ACTIVE_STATE_handler(stat
 }
 static state_machine_result_t NETWORK_WIFI_CONFIGURING_ACTIVE_STATE_exit_handler(state_machine_t* const State_Machine) {
     network_exit_handler_print(State_Machine, true);
+    displayer_wifi_setup(NULL,NULL,NULL,false);
     /* bring down DNS hijack */
     ESP_LOGD(TAG, " Stopping DNS.");
     dns_server_stop();    
@@ -1087,7 +1116,7 @@ static state_machine_result_t WIFI_LOST_CONNECTION_STATE_handler(state_machine_t
             result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_LOST_CONNECTION_STATE],__FUNCTION__);
             break;
         case EN_CONNECT:
-            result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_CONNECTING_STATE],__FUNCTION__);
+            result= local_traverse_state(State_Machine, &Wifi_Configuring_State[WIFI_CONNECTING_STATE],__FUNCTION__);
             break;
         default:
             result= EVENT_UN_HANDLED;

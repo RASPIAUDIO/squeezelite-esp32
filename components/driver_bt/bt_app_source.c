@@ -9,6 +9,10 @@
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "esp_a2dp_legacy_api.h"
+#define ESP_A2D_MEDIA_CTRL_STOP ESP_A2D_MEDIA_CTRL_SUSPEND
+#endif
 #include "esp_avrc_api.h"
 #include "esp_console.h"
 #include "esp_pthread.h"
@@ -74,7 +78,7 @@ static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t
 static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param);
 
 /// callback function for A2DP source audio data stream
-static void a2d_app_heart_beat(void *arg);
+static void a2d_app_heart_beat(TimerHandle_t xTimer);
 
 /// A2DP application state machine
 static void bt_app_av_sm_hdlr(uint16_t event, void *param);
@@ -377,7 +381,7 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
         handle_bt_gap_pin_req(event, param);
         break;
 
-#if (CONFIG_BT_SSP_ENABLED == true)
+#if CONFIG_IDF_TARGET_ESP32S31 || CONFIG_BT_SSP_ENABLED
     case ESP_BT_GAP_CFM_REQ_EVT:
         ESP_LOGI(TAG,"ESP_BT_GAP_CFM_REQ_EVT Please compare the numeric value: %d", param->cfm_req.num_val);
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
@@ -406,7 +410,7 @@ int heart_beat_delay[] = {
     1000
 };
 
-static void a2d_app_heart_beat(void *arg)
+static void a2d_app_heart_beat(TimerHandle_t xTimer)
 {
     bt_app_work_dispatch(bt_app_av_sm_hdlr, BT_APP_HEART_BEAT_EVT, NULL, 0, NULL);
     int tmrduration=heart_beat_delay[bt_app_source_a2d_state];
@@ -704,16 +708,15 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
     switch (event) {
     case BT_APP_EVT_STACK_UP: {
     	ESP_LOGI(TAG,"BT Stack going up.");
+
         /* set up device name */
-
-
         char * a2dp_dev_name = 	config_alloc_get_default(NVS_TYPE_STR, "a2dp_dev_name", CONFIG_A2DP_DEV_NAME, 0);
     	if(a2dp_dev_name  == NULL){
     		ESP_LOGW(TAG,"Unable to retrieve the a2dp device name from nvs");
-    		esp_bt_dev_set_device_name(CONFIG_A2DP_DEV_NAME);
+    		esp_bt_gap_set_device_name(CONFIG_A2DP_DEV_NAME);
     	}
     	else {
-    		esp_bt_dev_set_device_name(a2dp_dev_name);
+    		esp_bt_gap_set_device_name(a2dp_dev_name);
     		free(a2dp_dev_name);
     	}
 
@@ -746,7 +749,7 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 
         /* create and start heart beat timer */
         int tmr_id = 0;
-        s_tmr = xTimerCreate("connTmr", ( prev_duration/ portTICK_RATE_MS),pdFALSE, (void *)tmr_id, a2d_app_heart_beat);        
+        s_tmr = xTimerCreate("connTmr", ( prev_duration/ portTICK_PERIOD_MS),pdFALSE, (void *)tmr_id, a2d_app_heart_beat);        
         xTimerStart(s_tmr, portMAX_DELAY);
         break;
     }

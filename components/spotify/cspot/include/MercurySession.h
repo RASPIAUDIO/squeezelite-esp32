@@ -10,6 +10,7 @@
 #include <vector>         // for vector
 
 #include "BellTask.h"             // for Task
+#include "AudioKeyRequests.h"
 #include "Packet.h"               // for Packet
 #include "Queue.h"                // for Queue
 #include "Session.h"              // for Session
@@ -95,8 +96,6 @@ class MercurySession : public bell::Task, public cspot::Session {
 
   void disconnect();
 
-  void disable() { isRunning = false; }
-
   void setConnectedHandler(ConnectionEstabilishedCallback callback);
 
   bool triggerTimeout() override;
@@ -115,17 +114,20 @@ class MercurySession : public bell::Task, public cspot::Session {
 
   std::unordered_map<uint64_t, ResponseCallback> callbacks;
   std::unordered_map<std::string, ResponseCallback> subscriptions;
-  std::unordered_map<uint32_t, AudioKeyCallback> audioKeyCallbacks;
+  AudioKeyRequests audioKeys;
+  std::mutex audioKeyMutex;
+  void dispatchAudioKeys();
+  void abortAudioKeys();
 
   uint64_t sequenceId = 1;
-  uint32_t audioKeySequence = 1;
 
   unsigned long long timestampDiff;
   unsigned long long lastPingTimestamp = -1;
   std::string countryCode = "";
 
-  std::mutex isRunningMutex, connectingMutex;
+  std::mutex isRunningMutex;
   std::atomic<bool> isRunning = false;
+  std::atomic<bool> isReconnecting = false;
   std::atomic<bool> executeEstabilishedCallback = false;
 
   void failAllPending();

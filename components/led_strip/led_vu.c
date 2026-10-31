@@ -1,18 +1,18 @@
-/* 
- *  Control of LED strip within squeezelite-esp32 
- *     
+/*
+ *  Control of LED strip within squeezelite-esp32
+ *
  *  (c) Wizmo 2021
  *
- *  Loosely based on code by 
+ *  Loosely based on code by
  *     Chuck Rohs 2020, chuck@zethus.ca
- * 
+ *
  *  This software is released under the MIT License.
  *  https://opensource.org/licenses/MIT
  *
  * ToDo:
- * Driver does support other led device. Maybe look at supporting in future. 
+ * Driver does support other led device. Maybe look at supporting in future.
  * The VU refresh rate has been decreaced (100->75) to optimize animation of spin dial.  Could make
- *   configurable like text scrolling (or use the same value) 
+ *   configurable like text scrolling (or use the same value)
  * Artwork function, but not released as very buggy and not really practical
  */
 
@@ -47,9 +47,9 @@ static int battery_status = 0;
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 
 struct led_strip_t* led_display = NULL;
-static EXT_RAM_ATTR struct led_strip_t  led_strip_config;
+static EXT_RAM_BSS_ATTR struct led_strip_t  led_strip_config;
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
     int gpio;
     int length;
     int vu_length;
@@ -66,7 +66,7 @@ static int led_addr(int pos ) {
 }
 
 static void battery_svc(float value, int cells) {
-	battery_status = battery_level_svc(); 
+	battery_status = battery_level_svc();
 	ESP_LOGI(TAG, "Called for battery service with volt:%f cells:%d status:%d", value, cells, battery_status);
 
 	if (battery_handler_chain) battery_handler_chain(value, cells);
@@ -74,15 +74,15 @@ static void battery_svc(float value, int cells) {
 
 /****************************************************************************************
  * Suspend.
- * 
+ *
  */
 static void led_vu_sleep(void) {
-    led_vu_clear(led_display); 
+    led_vu_clear();
 }
 
 /****************************************************************************************
  * Initialize the led vu strip if configured.
- * 
+ *
  */
 void led_vu_init()
 {
@@ -101,7 +101,7 @@ void led_vu_init()
     battery_handler_chain = battery_handler_svc;
     battery_handler_svc = battery_svc;
     battery_status = battery_level_svc();
-   
+
     if (strip.length > LED_VU_MAX_LENGTH) strip.length = LED_VU_MAX_LENGTH;
     // initialize vu meter settings
     if (strip.length < 10) {
@@ -125,24 +125,22 @@ void led_vu_init()
     led_strip_config.led_strip_working = heap_caps_malloc(strip.length * sizeof(struct led_color_t), MALLOC_CAP_8BIT);
     led_strip_config.led_strip_showing = heap_caps_malloc(strip.length * sizeof(struct led_color_t), MALLOC_CAP_8BIT);
     led_strip_config.gpio = strip.gpio;
-    led_strip_config.rmt_channel = RMT_NEXT_TX_CHANNEL();
 
-    // initialize driver 
+    // initialize driver
     bool led_init_ok = led_strip_init(&led_strip_config);
     if (led_init_ok) {
         led_display = &led_strip_config;
-        ESP_LOGI(TAG, "led_vu using gpio:%d length:%d on channel:%d", strip.gpio, strip.length, led_strip_config.rmt_channel);
+        ESP_LOGI(TAG, "led_vu using gpio:%d length:%d", strip.gpio, strip.length);
     } else {
         ESP_LOGE(TAG, "led_vu init failed");
         goto done;
     }
 
-    // reserver max memory for remote management systems
-    rmt_set_mem_block_num(led_strip_config.rmt_channel, 7);
+    // Memory block configuration is now set in RMT TX channel config (mem_block_symbols)
 
     services_sleep_setsuspend(led_vu_sleep);
 
-    led_vu_clear(led_display);
+    led_vu_clear();
 
     done:
         free(config);
@@ -187,7 +185,7 @@ void led_vu_clear() {
 void led_vu_color_all(uint8_t r, uint8_t g, uint8_t b) {
     if (!led_display) return;
 
-    struct led_color_t color_on = {.red = r, .green = g, .blue = b}; 
+    struct led_color_t color_on = {.red = r, .green = g, .blue = b};
 
     for (int i = 0 ; i < strip.length ; i ++){
         led_strip_set_pixel_color(led_display, i, &color_on);
@@ -199,17 +197,17 @@ void led_vu_color_all(uint8_t r, uint8_t g, uint8_t b) {
 /****************************************************************************************
  * Sets LEDs based on a data packet consiting of rgb data
  * offset - starting LED,
- * length - number of leds (3x rgb bytes) 
+ * length - number of leds (3x rgb bytes)
  * data - array of rgb values in multiples of 3 bytes
  */
 void led_vu_data(uint8_t* data, uint16_t offset, uint16_t length) {
     if (!led_display) return;
 
-	uint8_t* p = (uint8_t*) data;									        
-	for (int i = 0; i < length; i++) {					            
+	uint8_t* p = (uint8_t*) data;
+	for (int i = 0; i < length; i++) {
 		led_strip_set_pixel_rgb(led_display, i+offset, *p, *(p+1), *(p+2));
         p+=3;
-	} 
+	}
 
     led_strip_show(led_display);
 }
@@ -225,7 +223,7 @@ void led_vu_spectrum(uint8_t* data, int bright, int length, int style) {
     uint8_t gain,r,g,b;
     int width = strip.length / length;
     int pos = 0;
-    uint8_t* p = (uint8_t*) data;									        
+    uint8_t* p = (uint8_t*) data;
 	for (int i=0; i<length; i++) {
 		gain = *p;
         r = gain*gain/bright;
@@ -243,7 +241,7 @@ void led_vu_spectrum(uint8_t* data, int bright, int length, int style) {
         }
         p++;
     }
-    
+
     led_strip_show(led_display);
  }
 
@@ -271,10 +269,10 @@ void led_vu_progress_bar(int pct, int bright) {
 
 /****************************************************************************************
  * Spin dial display
- * gain - brightness (0-100), rate - color change speed (0-100) 
+ * gain - brightness (0-100), rate - color change speed (0-100)
  * comet - alternate display mode
  */
-void led_vu_spin_dial(int gain, int rate, int speed, bool comet) 
+void led_vu_spin_dial(int gain, int rate, int speed, bool comet)
 {
     if (!led_display) return;
 
@@ -282,11 +280,11 @@ void led_vu_spin_dial(int gain, int rate, int speed, bool comet)
     static uint8_t r = 0;
     static uint8_t g = 0;
     static uint8_t b = 0;
-    
+
     // calculate next color
     uint8_t step = rate / 2; // controls color change speed
     if (r == 0 && g == 0 && b == 0) {
-        r = LED_VU_MAX; g = step; 
+        r = LED_VU_MAX; g = step;
     } else if (b == 0) {
         g = (g > LED_VU_MAX-step) ? LED_VU_MAX : g + step;
         r = (r < step) ? 0 : r - step;
@@ -295,15 +293,15 @@ void led_vu_spin_dial(int gain, int rate, int speed, bool comet)
         b = (b > LED_VU_MAX-step) ? LED_VU_MAX : b + step;
         g = (g < step) ? 0 : g- step;
         if (g == 0) r = step;
-    } else { 
+    } else {
         r = (r > LED_VU_MAX-step) ? LED_VU_MAX : r + step;
         b = (b < step) ? 0 : b - step;
         if (r == 0) b = step;
     }
 
-    uint8_t rp = r * gain / LED_VU_MAX; 
-    uint8_t gp = g * gain / LED_VU_MAX; 
-    uint8_t bp = b * gain / LED_VU_MAX; 
+    uint8_t rp = r * gain / LED_VU_MAX;
+    uint8_t gp = g * gain / LED_VU_MAX;
+    uint8_t bp = b * gain / LED_VU_MAX;
 
     // set led color
     speed++;
@@ -318,7 +316,7 @@ void led_vu_spin_dial(int gain, int rate, int speed, bool comet)
         led_strip_set_pixel_rgb(led_display, led_pos, rp, gp, bp);
         led_pos = led_addr(++led_pos);
     }
-    
+
     led_strip_show(led_display);
 }
 
@@ -369,7 +367,7 @@ void led_vu_display(int vu_l, int vu_r, int bright, bool comet) {
 
     // set the led bar values
     uint8_t step = bright / (strip.vu_length-1);
-    if (step < 1) step = 1; // dor low brightness or larger strips     
+    if (step < 1) step = 1; // dor low brightness or larger strips
     uint8_t g = bright * 2 / 3; // more red at top
     uint8_t r = 0;
     int shift = 0;
@@ -378,13 +376,13 @@ void led_vu_display(int vu_l, int vu_r, int bright, bool comet) {
         if (i == peak_l) {
             led_strip_set_pixel_rgb(led_display, strip.vu_start_l - i, r, g, bright);
         } else if (i <= vu_l) {
-            shift = vu_l - i; 
+            shift = vu_l - i;
             if (comet)
                 led_strip_set_pixel_rgb(led_display, strip.vu_start_l - i, r>>shift, g>>shift, 0);
             else
                 led_strip_set_pixel_rgb(led_display, strip.vu_start_l - i, r, g, 0);
         }
-        // set right  
+        // set right
         if (i == peak_r) {
             led_strip_set_pixel_rgb(led_display, strip.vu_start_r + i, r, g, bright);
         }  else if (i <= vu_r) {
@@ -406,7 +404,7 @@ void led_vu_display(int vu_l, int vu_r, int bright, bool comet) {
         led_strip_set_pixel_rgb(led_display, strip.vu_status, bright/2, bright/2, 0);
     else if (battery_status > 0)
         led_strip_set_pixel_rgb(led_display, strip.vu_status, bright, 0, 0);
-    
+
     led_strip_show(led_display);
 }
 

@@ -1,0 +1,95 @@
+diff --git a/src/sync_task.cpp b/src/sync_task.cpp
+index 3b64806..d9da16e 100644
+--- a/src/sync_task.cpp
++++ b/src/sync_task.cpp
+@@ -294,6 +294,12 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
+         if (!sync_context.aligning && !sync_context.sync_lost) {
+             sync_context.sync_lost = true;
+             SS_LOGW(TAG, "Lost sync (%" PRId64 "us off)", raw_error);
++            SS_LOGW(TAG,
++                    "Sync context: buffered=%" PRIu32 " frames, decoded=%zu bytes, "
++                    "endpoint_lead=%" PRId64 " us, late_skipped=%" PRIu32,
++                    sync_context.buffered_frames, sync_context.decode_buffer->available(),
++                    sync_context.new_audio_client_playtime - platform_time_us(),
++                    sync_context.late_chunks_skipped);
+         }
+     }
+ 
+@@ -636,6 +642,16 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
+ 
+         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
+             // This chunk will arrive too late to be played, skip it!
++            ++sync_context.late_chunks_skipped;
++            if (sync_context.late_chunks_skipped <= 8 ||
++                sync_context.late_chunks_skipped % 64 == 0) {
++                SS_LOGW(TAG,
++                        "Late chunk skipped: count=%" PRIu32 ", lateness=%" PRId64
++                        " us, buffered=%" PRIu32 " frames, encoded=%zu bytes",
++                        sync_context.late_chunks_skipped,
++                        sync_context.new_audio_client_playtime - client_timestamp,
++                        sync_context.buffered_frames, encoded_size(sync_context.encoded_item));
++            }
+             this->inbound_.return_item(sync_context.encoded_item);
+             sync_context.encoded_item = nullptr;
+             return DecodeResult::SKIPPED;
+@@ -648,6 +664,21 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
+             return decoded;
+         }
+         sync_context.decoded_timestamp = client_timestamp;
++        const int64_t timestamp = server_timestamp(sync_context.encoded_item);
++        const int64_t gap = timestamp - sync_context.expected_server_timestamp;
++        if (sync_context.expected_server_timestamp != 0 && (gap > 100 || gap < -100)) {
++            ++sync_context.timestamp_gaps;
++            if (sync_context.timestamp_gaps <= 8 || sync_context.timestamp_gaps % 64 == 0) {
++                SS_LOGW(TAG,
++                        "Chunk timestamp gap: count=%" PRIu32 ", gap=%" PRId64
++                        " us, decoded=%zu bytes, late_skipped=%" PRIu32,
++                        sync_context.timestamp_gaps, gap, sync_context.decode_buffer->available(),
++                        sync_context.late_chunks_skipped);
++            }
++        }
++        sync_context.expected_server_timestamp = timestamp +
++            sync_context.current_stream_info.frames_to_microseconds(
++                sync_context.current_stream_info.bytes_to_frames(sync_context.decode_buffer->available()));
+     }
+ 
+     // Return the encoded item to the ring
+@@ -792,6 +823,7 @@ bool SyncTask::wait_for_start_acknowledgement(SyncContext& sync_context) {
+ }
+ 
+ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
++    sync_context.expected_server_timestamp = 0;  // A seek intentionally changes the timeline.
+     // Drop in-flight decoded audio (it carries the pre-seek timestamp; appending post-seek audio to
+     // it would mis-stamp the buffer) and any pending hard-sync gap-fill silence. Codec/decoder
+     // state, buffered_frames and new_audio_client_playtime are deliberately left intact: the audio
+@@ -865,6 +897,9 @@ void SyncTask::reset_context(SyncContext& sync_context) {
+     sync_context.decoded_timestamp = 0;
+     sync_context.new_audio_client_playtime = 0;
+     sync_context.buffered_frames = 0;
++    sync_context.late_chunks_skipped = 0;
++    sync_context.expected_server_timestamp = 0;
++    sync_context.timestamp_gaps = 0;
+     sync_context.current_stream_info = AudioStreamInfo{};
+     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
+     sync_context.release_chunk = false;
+diff --git a/src/sync_task.h b/src/sync_task.h
+index 6ced0e2..cc3dda7 100644
+--- a/src/sync_task.h
++++ b/src/sync_task.h
+@@ -76,6 +76,7 @@ struct SyncContext {
+     // 64-bit fields
+     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
+     int64_t new_audio_client_playtime{0};
++    int64_t expected_server_timestamp{0};  // End of the last decoded chunk, before clock mapping.
+ 
+     // size_t fields
+     size_t bytes_per_frame{0};
+@@ -84,6 +85,8 @@ struct SyncContext {
+ 
+     // 32-bit fields
+     uint32_t buffered_frames{0};
++    uint32_t late_chunks_skipped{0};  // Bounded diagnostics, reset for each stream.
++    uint32_t timestamp_gaps{0};
+ 
+     // 16-bit fields
+     uint16_t active_ordinal{0};  // Ordinal of the codec header the active stream started on

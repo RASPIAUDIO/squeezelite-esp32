@@ -8,6 +8,7 @@
  */
 
 #include "platform_console.h"
+#include "improv_serial.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include "esp_console.h"
 #include "esp_vfs_dev.h"
 #include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "linenoise/linenoise.h"
 #include "argtable3/argtable3.h"
 #include "nvs.h" 
@@ -30,16 +32,15 @@
 
 #include "messaging.h"
 
-#include "config.h"
 static pthread_t thread_console;
-static void * console_thread();
+static void * console_thread(void *arg);
 void console_start();
 static const char * TAG = "console";
 extern bool bypass_network_manager;
 extern void register_squeezelite();
 
-static EXT_RAM_ATTR QueueHandle_t uart_queue;
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR QueueHandle_t uart_queue;
+static EXT_RAM_BSS_ATTR struct {
 		uint8_t _buf[512];
 		StaticRingbuffer_t _ringbuf;
 		RingbufHandle_t handle;
@@ -251,9 +252,44 @@ void process_autoexec(){
 
 static ssize_t stdin_read(int fd, void* data, size_t size) {
 	size_t bytes = -1;
+	static size_t uart_pending;
+    static bool ring_pending;
+	if (!size) return 0;
 	
 	while (1) {
-		QueueSetMemberHandle_t activated = xQueueSelectFromSet(stdin_redir.queue_set, portMAX_DELAY);
+		size_t plain = improv_serial_read_console(data, size);
+		if (plain) {
+			for (size_t i=0;i<plain;i++) if (((char*)data)[i]=='\r') ((char*)data)[i]='\n';
+			return plain;
+		}
+		// Picolibc may request one byte at a time. A UART_DATA event can
+		// describe an entire command; consume its remaining bytes before
+		// waiting for another event, otherwise the console stops after 'r'.
+		if (uart_pending) {
+			uint8_t byte;
+			int received = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, &byte, 1, 0);
+			if (received > 0) {
+				uart_pending -= received;
+				improv_serial_feed(byte);
+				continue;
+			}
+			uart_pending = 0;
+		}
+        // Like UART, web/telnet commands may be consumed one byte at a time.
+        // A partially received ring-buffer item does not post another queue-set
+        // event. Drain it before waiting, otherwise a web command stalls.
+        if (ring_pending) {
+            char *p = xRingbufferReceiveUpTo(stdin_redir.handle, &bytes, 0, size);
+            if (p) {
+                for (size_t i=0; i<bytes; i++) if (p[i]=='\0' || p[i]=='\r') p[i]='\n';
+                memcpy(data,p,bytes);
+                vRingbufferReturnItem(stdin_redir.handle,p);
+                return bytes;
+            }
+            ring_pending=false;
+        }
+		unsigned wait = improv_serial_wait_ms();
+		QueueSetMemberHandle_t activated = xQueueSelectFromSet(stdin_redir.queue_set, wait ? pdMS_TO_TICKS(wait) : portMAX_DELAY);
 	
 		if (activated == uart_queue) {
 			uart_event_t event;
@@ -261,18 +297,10 @@ static ssize_t stdin_read(int fd, void* data, size_t size) {
 			xQueueReceive(uart_queue, &event, 0);
 	
 			if (event.type == UART_DATA) {
-				bytes = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, data, size < event.size ? size : event.size, 0);
-				// we have to do our own line ending translation here 
-				for (int i = 0; i < bytes; i++) if (((char*)data)[i] == '\r') ((char*)data)[i] = '\n';
-				break;
+				uart_pending = event.size;
 			}	
 		} else if (xRingbufferCanRead(stdin_redir.handle, activated)) {
-			char *p = xRingbufferReceiveUpTo(stdin_redir.handle, &bytes, 0, size);
-			// we might receive strings, replace null by \n
-			for (int i = 0; i < bytes; i++) if (p[i] == '\0' || p[i] == '\r') p[i] = '\n';						
-			memcpy(data, p, bytes);
-			vRingbufferReturnItem(stdin_redir.handle, p);
-			break;
+            ring_pending=true;
 		}
 	}	
 	
@@ -283,9 +311,9 @@ static int stdin_dummy(const char * path, int flags, int mode) {	return 0; }
 
 void initialize_console() {
 	/* Minicom, screen, idf_monitor send CR when ENTER key is pressed (unused if we redirect stdin) */
-	esp_vfs_dev_uart_port_set_rx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CR);
+	uart_vfs_dev_port_set_rx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CR);
 	/* Move the caret to the beginning of the next line on '\n' */
-	esp_vfs_dev_uart_port_set_tx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CRLF);
+	uart_vfs_dev_port_set_tx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CRLF);
 
 	/* Configure UART. Note that REF_TICK is used so that the baud rate remains
 	 * correct while APB frequency is changing in light sleep mode.
@@ -300,10 +328,11 @@ void initialize_console() {
 	ESP_ERROR_CHECK( uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 3, &uart_queue, 0));
 	
 	/* Tell VFS to use UART driver */
-	esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
-		
+	uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+
 	/* re-direct stdin to our own driver so we can gather data from various sources */
-	stdin_redir.queue_set = xQueueCreateSet(2);
+	// Three UART event slots plus the ring buffer's read notification.
+	stdin_redir.queue_set = xQueueCreateSet(4);
 	stdin_redir.handle = xRingbufferCreateStatic(sizeof(stdin_redir._buf), RINGBUF_TYPE_BYTEBUF, stdin_redir._buf, &stdin_redir._ringbuf);
 	xRingbufferAddToQueueSetRead(stdin_redir.handle, stdin_redir.queue_set);
 	xQueueAddToSet(uart_queue, stdin_redir.queue_set);
@@ -352,6 +381,7 @@ bool console_push(const char *data, size_t size) {
 void console_start() {
 	/* we always run console b/c telnet sends commands to stdin */
 	initialize_console();
+	improv_serial_init();
 
 	/* Register commands */
 	MEMTRACE_PRINT_DELTA_MESSAGE("Registering help command");
@@ -448,7 +478,7 @@ static esp_err_t run_command(char * line){
 	return err;
 }
 
-static void * console_thread() {
+static void * console_thread(void *arg) {
 	if(!is_recovery_running){
 		MEMTRACE_PRINT_DELTA_MESSAGE("Running autoexec");
 		process_autoexec();

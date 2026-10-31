@@ -54,7 +54,11 @@
 #include "esp_pthread.h"
 #include "esp_system.h"
 #include <mbedtls/version.h>
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "crypto_s31.h"
+#else
 #include <mbedtls/aes.h>
+#endif
 #include "alac_wrapper.h"
 #endif
 
@@ -73,7 +77,9 @@ static log_level 	*loglevel = &raop_loglevel;
 // default buffer size
 #define BUFFER_FRAMES_MAX 	((RAOP_SAMPLE_RATE * 10) / 352 )
 #define BUFFER_FRAMES_MIN 	( (150 * RAOP_SAMPLE_RATE * 2) / (352 * 100) )
-#define MAX_PACKET       1408
+// A 352-frame stereo L16 payload is already 1408 bytes, before RTP headers.
+// ALAC escape frames add a few more bytes; leave room for retransmission too.
+#define MAX_PACKET       2048
 #define MIN_LATENCY		11025
 #define MAX_LATENCY   	( (120 * RAOP_SAMPLE_RATE * 2) / 100 )
 
@@ -107,10 +113,16 @@ typedef struct rtp_s {
 	unsigned char aesiv[16];
 #ifdef WIN32
 	AES_KEY aes;
+#elif CONFIG_IDF_TARGET_ESP32S31
+    mbedtls_svc_key_id_t aes;
 #else
 	mbedtls_aes_context aes;
 #endif
 	bool decrypt;
+	bool pcm;
+	uint32_t decoded_packets, decoded_bytes, decode_errors, pcm_fnv;
+	uint32_t pcm_packet_xor, pcm_packet_sum, decoded_nonsequential;
+	uint16_t decoded_first_seq, decoded_last_seq;
 	u8_t *decrypt_buf;
 	u32_t frame_size, frame_duration;
 	u32_t in_frames, out_frames;
@@ -166,7 +178,7 @@ static void 	rtp_thread_func(void *arg);
 #endif	
 
 /*---------------------------------------------------------------------------*/
-static struct alac_codec_s* alac_init(int fmtp[32]) {
+static struct alac_codec_s* alac_init(int fmtp[12]) {
 	struct alac_codec_s *alac;
 	unsigned sample_rate, block_size;
 	unsigned char sample_size, channels;
@@ -206,7 +218,7 @@ static struct alac_codec_s* alac_init(int fmtp[32]) {
 }
 
 /*---------------------------------------------------------------------------*/
-rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv, char *fmtpstr,
+rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv, char *fmtpstr, bool pcm,
 								short unsigned pCtrlPort, short unsigned pTimingPort,
 								uint8_t *buffer, size_t size,
 								raop_cmd_cb_t cmd_cb, raop_data_cb_t data_cb)
@@ -219,6 +231,27 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	rtp_resp_t resp = { 0, 0, 0, NULL };
 
 	if (!ctx) return resp;
+	// Parse a bounded copy: strsep modifies its input, which the RTSP session
+	// must retain for subsequent SETUP requests.
+	char *format = fmtpstr ? strdup(fmtpstr) : NULL;
+	char *cursor = format;
+	memset(fmtp, 0, sizeof(fmtp));
+	while (cursor && (arg = strsep(&cursor, " \t")) != NULL) {
+		if (!*arg) continue;
+		if (i == 12) { i++; break; }
+		fmtp[i++] = atoi(arg);
+	}
+	bool valid_format = i == 12 && !cursor && fmtp[1] > 0 &&
+		fmtp[1] <= 352 && fmtp[3] == 16 &&
+		fmtp[7] == 2 && fmtp[11] == RAOP_SAMPLE_RATE;
+	free(format);
+	if (!valid_format) {
+		LOG_WARN("Invalid or unsupported RAOP fmtp");
+		free(ctx);
+		return resp;
+	}
+	ctx->pcm = pcm;
+	ctx->pcm_fnv = 2166136261u;
 	
 	ctx->host = host;
 	ctx->decrypt = false;
@@ -243,6 +276,12 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 		memcpy(ctx->aesiv, aesiv, 16);
 #ifdef WIN32
 		AES_set_decrypt_key((unsigned char*) aeskey, 128, &ctx->aes);
+#elif CONFIG_IDF_TARGET_ESP32S31
+        if (raop_aes_s31_import((unsigned char *)aeskey, &ctx->aes) != PSA_SUCCESS) {
+            pthread_mutex_destroy(&ctx->ab_mutex);
+            free(ctx);
+            return resp;
+        }
 #else
 		memset(&ctx->aes, 0, sizeof(mbedtls_aes_context));
 		mbedtls_aes_setkey_dec(&ctx->aes, (unsigned char*) aeskey, 128);
@@ -251,15 +290,15 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 		ctx->decrypt_buf = malloc(MAX_PACKET);
 	}
 
-	memset(fmtp, 0, sizeof(fmtp));
-	while ((arg = strsep(&fmtpstr, " \t")) != NULL) fmtp[i++] = atoi(arg);
-
 	ctx->frame_size = fmtp[1];
 	ctx->frame_duration = (ctx->frame_size * 1000) / RAOP_SAMPLE_RATE;
 
 	// alac decoder
-	ctx->alac_codec = alac_init(fmtp);
-	rc &= ctx->alac_codec != NULL;
+	if (!ctx->pcm) {
+		ctx->alac_codec = alac_init(fmtp);
+		rc &= ctx->alac_codec != NULL;
+	}
+	LOG_INFO("RAOP packet format: %s", ctx->pcm ? "PCM L16" : "ALAC");
 
 	buffer_alloc(ctx->audio_buffer, ctx->frame_size*4, buffer, size);
 
@@ -318,9 +357,17 @@ void rtp_end(rtp_t *ctx)
 	}
 	
 	for (i = 0; i < 3; i++) closesocket(ctx->rtp_sockets[i].sock);
+	LOG_INFO("RAOP decoded: packets=%u bytes=%u errors=%u first=%hu last=%hu fnv=%08x",
+		ctx->decoded_packets, ctx->decoded_bytes, ctx->decode_errors,
+		ctx->decoded_first_seq, ctx->decoded_last_seq, ctx->pcm_fnv);
+	LOG_INFO("RAOP packet fingerprints: xor=%08x sum=%08x nonsequential=%u",
+		ctx->pcm_packet_xor, ctx->pcm_packet_sum, ctx->decoded_nonsequential);
 
 	if (ctx->alac_codec) alac_delete_decoder(ctx->alac_codec);
 	if (ctx->decrypt_buf) free(ctx->decrypt_buf);
+#if CONFIG_IDF_TARGET_ESP32S31
+    if (ctx->aes) psa_destroy_key(ctx->aes);
+#endif
 	
 	pthread_mutex_destroy(&ctx->ab_mutex);
 	buffer_release(ctx->audio_buffer);
@@ -409,27 +456,42 @@ static int seq_order(seq_t a, seq_t b) {
 }
 
 /*---------------------------------------------------------------------------*/
-static u16_t alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len) {
+static void alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len, u16_t *outsize) {
 	unsigned char iv[16];
 	int aeslen;
-    unsigned int frames;
-	assert(len<=MAX_PACKET);
+	unsigned int decoded_frames = 0;
+	*outsize = 0;
+	if (len <= 0 || len > MAX_PACKET) return;
 
 	if (ctx->decrypt) {
 		aeslen = len & ~0xf;
 		memcpy(iv, ctx->aesiv, sizeof(iv));
 #ifdef WIN32
 		AES_cbc_encrypt((unsigned char*)buf, ctx->decrypt_buf, aeslen, &ctx->aes, iv, AES_DECRYPT);
+#elif CONFIG_IDF_TARGET_ESP32S31
+        if (raop_aes_s31_decrypt(ctx->aes, iv, (unsigned char *)buf, ctx->decrypt_buf, aeslen) != PSA_SUCCESS) {
+            LOG_WARN("RAOP AES packet decrypt failed");
+            return;
+        }
 #else
 		mbedtls_aes_crypt_cbc(&ctx->aes, MBEDTLS_AES_DECRYPT, aeslen, iv, (unsigned char*) buf, ctx->decrypt_buf);
 #endif
 		memcpy(ctx->decrypt_buf+aeslen, buf+aeslen, len-aeslen);
-		alac_to_pcm(ctx->alac_codec, (unsigned char*) ctx->decrypt_buf, (unsigned char*) dest, 2, &frames);
+		buf = (char *)ctx->decrypt_buf;
+	}
+	if (ctx->pcm) {
+		if (len % 4 || len > ctx->frame_size * 4) return;
+		// RTP L16 is network byte order; the output buffer uses native samples.
+		for (int i = 0; i < len / 2; i++) {
+			const unsigned char *sample = (unsigned char *)buf + i * 2;
+			dest[i] = (s16_t)((sample[0] << 8) | sample[1]);
+		}
+		decoded_frames = len / 4;
 	} else {
-		alac_to_pcm(ctx->alac_codec, (unsigned char*) buf, (unsigned char*) dest, 2, &frames);
-	}	
+		if (!alac_to_pcm(ctx->alac_codec, (unsigned char*) buf, (unsigned char*) dest, 2, &decoded_frames)) return;
+	}
 	
-	return frames * 4;
+	if (decoded_frames <= UINT16_MAX / 4) *outsize = decoded_frames * 4;
 }
 
 
@@ -524,7 +586,31 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 	}
 
 	if (abuf) {
-		abuf->len = alac_decode(ctx, abuf->data, data, len);
+		u16_t decoded_len;
+		alac_decode(ctx, abuf->data, data, len, &decoded_len);
+		if (!decoded_len) {
+			ctx->decode_errors++;
+			pthread_mutex_unlock(&ctx->ab_mutex);
+			return;
+		}
+		if (!ctx->decoded_packets) ctx->decoded_first_seq = seqno;
+		else if (seqno != (uint16_t) (ctx->decoded_last_seq + 1)) ctx->decoded_nonsequential++;
+		ctx->decoded_last_seq = seqno;
+		ctx->decoded_packets++;
+		ctx->decoded_bytes += decoded_len;
+		// Include sequence identity so a duplicate cannot substitute for a lost
+		// packet. These aggregates tolerate arrival reordering; pcm_fnv does not.
+		uint32_t packet_fnv = (2166136261u ^ (seqno & 255u)) * 16777619u;
+		packet_fnv = (packet_fnv ^ (seqno >> 8)) * 16777619u;
+		for (unsigned i = 0; i < decoded_len; i++) {
+			ctx->pcm_fnv ^= ((unsigned char *)abuf->data)[i];
+			ctx->pcm_fnv *= 16777619u;
+			packet_fnv ^= ((unsigned char *)abuf->data)[i];
+			packet_fnv *= 16777619u;
+		}
+		ctx->pcm_packet_xor ^= packet_fnv;
+		ctx->pcm_packet_sum += packet_fnv;
+		abuf->len = decoded_len;
 		abuf->ready = 1;
         abuf->missed = 0;
 		// this is the local rtptime when this frame is expected to play
@@ -658,7 +744,7 @@ static void rtp_thread_func(void *arg) {
 			ntp_sent = rtp_request_timing(ctx);
 		}
 
-		if (plen <= 0) {
+		if (plen < 2) {
 			LOG_WARN("Nothing received on a readable socket %d", plen);
 			continue;
 		}
@@ -675,6 +761,7 @@ static void rtp_thread_func(void *arg) {
 
 			// re-sent packet
 			case 0x56: {
+				if (plen < 16) break;
 				pktp += 4;
 				plen -= 4;
 			}	
@@ -682,6 +769,7 @@ static void rtp_thread_func(void *arg) {
 			
 			// data packet
 			case 0x60: {
+				if (plen < 12) break;
 				seqno = ntohs(*(u16_t*)(pktp+2));
 				rtptime = ntohl(*(u32_t*)(pktp+4));
 
@@ -705,6 +793,7 @@ static void rtp_thread_func(void *arg) {
 
 			// sync packet
 			case 0x54: {
+				if (plen < 20) break;
 				u32_t rtp_now_latency = ntohl(*(u32_t*)(pktp+4));
 				u64_t remote = (((u64_t) ntohl(*(u32_t*)(pktp+8))) << 32) + ntohl(*(u32_t*)(pktp+12));
 				u32_t rtp_now = ntohl(*(u32_t*)(pktp+16));

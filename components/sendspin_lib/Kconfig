@@ -1,0 +1,58 @@
+menu "sendspin-cpp"
+
+    config SENDSPIN_CPP_WS_SUPPORT
+        bool
+        default y
+        select HTTPD_WS_SUPPORT
+        # Event-driven WebSocket upgrade detection (src/esp/ws_server.cpp). The symbol only
+        # exists on IDF >= 5.5.5 / 6.0.1 (Kconfig default n there, with a `depends on
+        # HTTPD_WS_SUPPORT` satisfied by the select above). On older IDF the symbol is undefined
+        # and this select is silently ignored, which is fine: those versions dispatch the upgrade
+        # GET to the URI handler natively, so there is nothing to enable.
+        select HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+        # esp_websocket_client's own symbol (default n; ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS, default
+        # 2000, sits under it). Without it sends take the lock the client task holds while it runs
+        # the receive handler, which can park waiting for inbound ring space, so the protocol
+        # task's sends fail on their short timeout instead of going out.
+        select ESP_WS_CLIENT_SEPARATE_TX_LOCK
+
+    config SENDSPIN_ENABLE_PLAYER
+        bool "Enable player role (audio decode/playback)"
+        default y
+
+    config SENDSPIN_ENABLE_OPUS
+        bool "Enable Opus"
+        depends on SENDSPIN_ENABLE_PLAYER || SENDSPIN_ENABLE_SOURCE
+        default y
+        help
+            Compiles micro-opus into the player role (opus in its audio formats) and the
+            source role (opus streams). Opus is covered by third-party patents (see the
+            player and source role specs); disable to drop the codec and its dependency.
+            The source role's encoder needs micro-opus's thread-safe pseudostack
+            allocation mode (the default).
+
+    config SENDSPIN_ENABLE_CONTROLLER
+        bool "Enable controller role"
+        default y
+
+    config SENDSPIN_ENABLE_METADATA
+        bool "Enable metadata role"
+        default y
+
+    config SENDSPIN_ENABLE_COLOR
+        bool "Enable color role"
+        default y
+
+    config SENDSPIN_ENABLE_ARTWORK
+        bool "Enable artwork role"
+        default y
+
+    config SENDSPIN_ENABLE_VISUALIZER
+        bool "Enable visualizer role"
+        default y
+
+    config SENDSPIN_ENABLE_SOURCE
+        bool "Enable source role (audio capture)"
+        default y
+
+endmenu

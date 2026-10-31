@@ -20,7 +20,6 @@
 #include "esp_log.h"
 #include "esp_task.h"
 #include "driver/gpio.h"
-#include "driver/rmt.h"
 #include "gpio_exp.h"
 #include "buttons.h"
 #include "services.h"
@@ -29,15 +28,15 @@
 
 static const char * TAG = "buttons";
 
-static EXT_RAM_ATTR int n_buttons;
-static EXT_RAM_ATTR uint32_t buttons_idle_since;
+static EXT_RAM_BSS_ATTR int n_buttons;
+static EXT_RAM_BSS_ATTR uint32_t buttons_idle_since;
 
 #define BUTTON_STACK_SIZE	4096
 #define MAX_BUTTONS			32
 #define DEBOUNCE			50
 #define BUTTON_QUEUE_LEN	10
 
-static EXT_RAM_ATTR struct button_s {
+static EXT_RAM_BSS_ATTR struct button_s {
 	void *client;
 	int gpio;
 	int debounce;
@@ -50,7 +49,7 @@ static EXT_RAM_ATTR struct button_s {
 	TimerHandle_t timer;
 } buttons[MAX_BUTTONS];
 
-// can't use EXT_RAM_ATTR for initialized structure
+// can't use EXT_RAM_BSS_ATTR for initialized structure
 static struct {
 	int gpio, level;
 	struct button_s *button;
@@ -58,7 +57,7 @@ static struct {
 
 static TimerHandle_t polled_timer;
 
-static EXT_RAM_ATTR struct encoder {
+static EXT_RAM_BSS_ATTR struct encoder {
 	QueueHandle_t queue;
 	void *client;
 	rotary_encoder_info_t info;
@@ -66,13 +65,13 @@ static EXT_RAM_ATTR struct encoder {
 	rotary_handler handler;
 } rotary, volume;
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
 	RingbufHandle_t rb;
 	infrared_handler handler;
 } infrared;
 
-static EXT_RAM_ATTR QueueHandle_t button_queue;
-static EXT_RAM_ATTR QueueSetHandle_t common_queue_set;
+static EXT_RAM_BSS_ATTR QueueHandle_t button_queue;
+static EXT_RAM_BSS_ATTR QueueSetHandle_t common_queue_set;
 
 static void buttons_task(void* arg);
 static void buttons_handler(struct button_s *button, int level);
@@ -82,7 +81,7 @@ static void buttons_handler(struct button_s *button, int level);
  */
 static void common_task_init(void) {
 	static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-	static EXT_RAM_ATTR StackType_t xStack[BUTTON_STACK_SIZE] __attribute__ ((aligned (4)));
+	static EXT_RAM_BSS_ATTR StackType_t xStack[BUTTON_STACK_SIZE] __attribute__ ((aligned (4)));
 	
 	if (!common_queue_set) {
 		common_queue_set = xQueueCreateSet(BUTTON_QUEUE_LEN + 1);
@@ -147,7 +146,7 @@ static void buttons_handler(struct button_s *button, int level) {
 	if (button->long_press && !button->long_timer && button->level == button->type) {
 		// detect a long press, so hold event generation
 		ESP_LOGD(TAG, "setting long timer gpio:%u level:%u", button->gpio, button->level);
-		xTimerChangePeriod(button->timer, button->long_press / portTICK_RATE_MS, 0);
+		xTimerChangePeriod(button->timer, button->long_press / portTICK_PERIOD_MS, 0);
 		button->long_timer = true;
 	} else {
 		// send a button pressed/released event (content is copied in queue)
@@ -285,7 +284,7 @@ void button_create(void *client, int gpio, int type, bool pull, int debounce, bu
 	buttons[n_buttons].long_press = long_press;
 	buttons[n_buttons].shifter_gpio = shifter_gpio;
 	buttons[n_buttons].type = type;
-	buttons[n_buttons].timer = xTimerCreate("buttonTimer", buttons[n_buttons].debounce / portTICK_RATE_MS, pdFALSE, (void *) &buttons[n_buttons], buttons_timer_handler);
+	buttons[n_buttons].timer = xTimerCreate("buttonTimer", buttons[n_buttons].debounce / portTICK_PERIOD_MS, pdFALSE, (void *) &buttons[n_buttons], buttons_timer_handler);
 	buttons[n_buttons].self = buttons + n_buttons;
 
 	for (int i = 0; i < n_buttons; i++) {
@@ -321,7 +320,7 @@ void button_create(void *client, int gpio, int type, bool pull, int debounce, bu
 	// nasty ESP32 bug: fire-up constantly INT on GPIO 36/39 if ADC1, AMP, Hall used which WiFi does when PS is activated
 	for (int i = 0; polled_gpio[i].gpio != -1; i++) if (polled_gpio[i].gpio == gpio) {
 		if (!polled_timer) {
-			polled_timer = xTimerCreate("buttonsPolling", 100 / portTICK_RATE_MS, pdTRUE, polled_gpio, buttons_polling);		
+			polled_timer = xTimerCreate("buttonsPolling", 100 / portTICK_PERIOD_MS, pdTRUE, polled_gpio, buttons_polling);		
 			xTimerStart(polled_timer, portMAX_DELAY);
 		}	
 	

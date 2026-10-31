@@ -3,11 +3,14 @@
 #endif
 #include "network_wifi.h"
 #include <string.h>
+#include <stdatomic.h>
+#include <sys/queue.h>
 #include "cJSON.h"
 #include "dns_server.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "lwip/sockets.h"
@@ -28,6 +31,16 @@ static inline const char* password_string(const wifi_sta_config_t* sta);
 cJSON* accessp_cjson = NULL;
 
 static const char TAG[] = "network_wifi";
+static atomic_uint completed_scan_generation;
+unsigned network_wifi_scan_generation(void) {
+    return atomic_load(&completed_scan_generation);
+}
+bool network_wifi_setup_enabled(void) {
+    char *value = config_alloc_get(NVS_TYPE_STR, "wifi_setup");
+    bool enabled = !value || !strcasecmp(value,"Y") || !strcmp(value,"1");
+    free(value);
+    return enabled;
+}
 const char network_wifi_nvs_namespace[] = "config";
 const char ap_list_nsv_namespace[] = "aplist";
 /* rrm ctx */
@@ -42,7 +55,7 @@ wifi_ap_record_t* accessp_records = NULL;
 #define UINT_TO_STRING(val)                \
     static char loc[sizeof(val) + 1];      \
     memset(loc, 0x00, sizeof(loc));        \
-    strlcpy(loc, (char*)val, sizeof(loc)); \
+    memcpy(loc, val, sizeof(val));        \
     return loc;
 
 static inline const char* ssid_string(const wifi_sta_config_t* sta) {
@@ -71,7 +84,7 @@ typedef struct known_access_point {
 } known_access_point_t;
 
 /** linked list of command structures */
-static EXT_RAM_ATTR SLIST_HEAD(ap_list, known_access_point) s_ap_list;
+static EXT_RAM_BSS_ATTR SLIST_HEAD(ap_list, known_access_point) s_ap_list;
 known_access_point_t* network_wifi_get_ap_entry(const char* ssid) {
     known_access_point_t* it;
 
@@ -196,7 +209,7 @@ esp_err_t network_wifi_add_ap_from_sta_copy(const wifi_sta_config_t* sta) {
         ESP_LOGE(TAG, "Invalid access point entry");
         return ESP_ERR_INVALID_ARG;
     }
-    if (!sta->ssid || strlen((char*)sta->ssid) == 0) {
+    if (strlen((char*)sta->ssid) == 0) {
         ESP_LOGE(TAG, "Invalid access point ssid");
         return ESP_ERR_INVALID_ARG;
     }
@@ -573,12 +586,13 @@ void network_wifi_load_known_access_points() {
         ESP_LOGW(TAG, "Access points already loaded");
         return;
     }
-    nvs_iterator_t it = nvs_entry_find(NVS_DEFAULT_PART_NAME, ap_list_nsv_namespace, NVS_TYPE_ANY);
-    if (it == NULL) {
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, ap_list_nsv_namespace, NVS_TYPE_ANY, &it);
+    if (err != ESP_OK) {
         ESP_LOGW(TAG, "No known access point found");
         return;
     }
-    do {
+    while (err == ESP_OK && it != NULL) {
         nvs_entry_info_t info;
         nvs_entry_info(it, &info);
         if (strstr(info.namespace_name, ap_list_nsv_namespace)) {
@@ -590,8 +604,9 @@ void network_wifi_load_known_access_points() {
             }
             FREE_AND_NULL(value);
         }
-        it = nvs_entry_next(it);
-    } while (it != NULL);
+        err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
 
     return;
 }
@@ -825,6 +840,9 @@ void network_wifi_add_access_point_json(cJSON* ap_list, wifi_ap_record_t* ap_rec
         cJSON_AddNumberToObject(radio, "b", ap_rec->phy_11b ? 1 : 0);
         cJSON_AddNumberToObject(radio, "g", ap_rec->phy_11g ? 1 : 0);
         cJSON_AddNumberToObject(radio, "n", ap_rec->phy_11n ? 1 : 0);
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+        cJSON_AddNumberToObject(radio, "ax", ap_rec->phy_11ax ? 1 : 0);
+#endif
         cJSON_AddNumberToObject(radio, "low_rate", ap_rec->phy_lr ? 1 : 0);
         cJSON_AddItemToObject(ap, "radio", radio);
     }
@@ -1054,6 +1072,7 @@ esp_err_t wifi_scan_done() {
     FREE_AND_NULL(accessp_records);
     if (ap_num > 0) {
         accessp_records = (wifi_ap_record_t*)malloc_init_external(sizeof(wifi_ap_record_t) * ap_num);
+        if (!accessp_records) return ESP_ERR_NO_MEM;
         if ((err = esp_wifi_scan_get_ap_records(&ap_num, accessp_records)) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to retrieve scan results list. Error %s", esp_err_to_name(err));
             return err;
@@ -1074,8 +1093,12 @@ esp_err_t wifi_scan_done() {
     } else {
         //
         ESP_LOGD(TAG, "No AP Found.  Emptying the list.");
-        accessp_cjson = network_wifi_get_new_array_json(&accessp_cjson);
+        if (network_status_lock_json_buffer(pdMS_TO_TICKS(1000))) {
+            accessp_cjson = network_wifi_get_new_array_json(&accessp_cjson);
+            network_status_unlock_json_buffer();
+        } else err = ESP_FAIL;
     }
+    if (err == ESP_OK) atomic_fetch_add(&completed_scan_generation, 1);
     return err;
 }
 bool is_wifi_up() {
@@ -1149,9 +1172,9 @@ esp_err_t network_wifi_connect(const char* ssid, const char* password) {
         }
     }
     // copy configuration and connect
-    strlcpy((char*)config.sta.ssid, ssid, sizeof(config.sta.ssid));
+    memcpy(config.sta.ssid, ssid, strnlen(ssid, sizeof(config.sta.ssid)));
     if (password) {
-        strlcpy((char*)config.sta.password, password, sizeof(config.sta.password));
+        memcpy(config.sta.password, password, strnlen(password, sizeof(config.sta.password)));
     }
 
     // First Disconnect

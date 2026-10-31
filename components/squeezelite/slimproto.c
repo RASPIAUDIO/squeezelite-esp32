@@ -24,6 +24,14 @@
 
 #include "squeezelite.h"
 #include "slimproto.h"
+#if CONFIG_MNCAST_SENDSPIN
+#include "audio_source.h"
+#include "audio_controls.h"
+#include "display.h"
+#endif
+#ifdef EMBEDDED
+extern uint32_t halSTORAGE_RebootCounterUpdate(int32_t xValue);
+#endif
 
 static log_level loglevel;
 
@@ -46,6 +54,11 @@ static in_addr_t slimproto_ip = 0;
 static u16_t slimproto_hport = 9000;
 static u16_t slimproto_cport = 9090;
 static u8_t	player_id;
+#if CONFIG_MNCAST_SENDSPIN
+// LMS can send volume while another source owns output. Remember its setting
+// for its next explicit stream, without changing the current source's gain.
+static unsigned lms_gain_left = FIXED_ONE, lms_gain_right = FIXED_ONE;
+#endif
 
 extern struct buffer *streambuf;
 extern struct buffer *outputbuf;
@@ -295,7 +308,7 @@ void sendIR(u32_t code, u32_t ts) {
 }
 #endif
 
-static void process_strm(u8_t *pkt, int len) {
+static void process_strm_inner(u8_t *pkt, int len) {
 	struct strm_packet *strm = (struct strm_packet *)pkt;
 
 	LOG_DEBUG("strm command %c", strm->command);
@@ -327,6 +340,9 @@ static void process_strm(u8_t *pkt, int len) {
 		{
 			unsigned interval = unpackN(&strm->replay_gain);
 			LOCK_O;
+#if CONFIG_MNCAST_SENDSPIN
+            if (output.external) { UNLOCK_O; break; }
+#endif
 			output.pause_frames = interval * status.current_sample_rate / 1000;
 			if (interval) {
 				output.state = OUTPUT_PAUSE_FRAMES;
@@ -343,6 +359,9 @@ static void process_strm(u8_t *pkt, int len) {
 		{
 			unsigned interval = unpackN(&strm->replay_gain);
 			LOCK_O;
+#if CONFIG_MNCAST_SENDSPIN
+            if (output.external) { UNLOCK_O; break; }
+#endif
 			output.skip_frames = interval * status.current_sample_rate / 1000;
 			output.state = OUTPUT_SKIP_FRAMES;				
 			UNLOCK_O;
@@ -353,6 +372,9 @@ static void process_strm(u8_t *pkt, int len) {
 		{
 			unsigned jiffies = unpackN(&strm->replay_gain);
 			LOCK_O;
+#if CONFIG_MNCAST_SENDSPIN
+            if (output.external) { UNLOCK_O; break; }
+#endif
 			output.state = jiffies ? OUTPUT_START_AT : OUTPUT_RUNNING;
 			output.start_at = jiffies;
 			UNLOCK_O;
@@ -400,8 +422,17 @@ static void process_strm(u8_t *pkt, int len) {
 			sendSTAT("STMc", 0);
 			sentSTMu = sentSTMo = sentSTMl = false;
 #if EMBEDDED
+#if CONFIG_MNCAST_SENDSPIN
+            // Revoke before accepting LMS PCM. Do not perform blocking network
+            // disconnects under the transition lock. Old PCM/control callbacks
+            // are owner-guarded; Sendspin's loop leaves its revoked group.
+            audio_source_changed();
+            displayer_control(DISPLAYER_SHUTDOWN);
+            actrls_unset();
+#else
 			// not protected so that restore can call synchronously sink handlers
 			if (output.external) decode_restore(output.external);
+#endif
 			LOCK_O;
 			output.external = 0;
 			_buf_limit(outputbuf, 0);
@@ -415,6 +446,9 @@ static void process_strm(u8_t *pkt, int len) {
 			output.invert = (strm->flags & 0x03) == 0x03;
 			output.channels = (strm->flags & 0x0c) >> 2;
 			UNLOCK_O;            
+#if CONFIG_MNCAST_SENDSPIN
+            set_volume_owned(0, lms_gain_left, lms_gain_right);
+#endif
 			LOG_DEBUG("set fade: %u, channels: %u, invert: %u", output.fade_mode, output.channels, output.invert);
 		}
 		break;
@@ -422,6 +456,16 @@ static void process_strm(u8_t *pkt, int len) {
 		LOG_WARN("unhandled strm %c", strm->command);
 		break;
 	}
+}
+
+static void process_strm(u8_t *pkt, int len) {
+#if CONFIG_MNCAST_SENDSPIN
+    audio_source_lock();
+#endif
+    process_strm_inner(pkt, len);
+#if CONFIG_MNCAST_SENDSPIN
+    audio_source_unlock();
+#endif
 }
 
 static void process_cont(u8_t *pkt, int len) {
@@ -446,7 +490,19 @@ static void process_codc(u8_t *pkt, int len) {
 	struct codc_packet *codc = (struct codc_packet *)pkt;
 
 	LOG_DEBUG("codc: %c", codc->format);
+#if CONFIG_MNCAST_SENDSPIN
+    // A delayed codec response belongs to the preceding LMS request, not to a
+    // source that has since taken over. Keep the check through codec_open.
+    audio_source_lock();
+    LOCK_O;
+    bool lms_owner = !output.external;
+    UNLOCK_O;
+    if (!lms_owner) { audio_source_unlock(); return; }
+#endif
 	codec_open(codc->format, codc->pcm_sample_size, codc->pcm_sample_rate, codc->pcm_channels, codc->pcm_endianness);
+#if CONFIG_MNCAST_SENDSPIN
+    audio_source_unlock();
+#endif
 }
 
 static void process_aude(u8_t *pkt, int len) {
@@ -454,11 +510,13 @@ static void process_aude(u8_t *pkt, int len) {
 
 	LOG_DEBUG("enable spdif: %d dac: %d", aude->enable_spdif, aude->enable_dac);
     
-#if EMBEDDED
-    powering(aude->enable_spdif),
-#endif    
-
 	LOCK_O;
+#if CONFIG_MNCAST_SENDSPIN
+    if (output.external) { UNLOCK_O; return; }
+#endif
+#if EMBEDDED
+    powering(aude->enable_spdif);
+#endif
 	if (!aude->enable_spdif && output.state != OUTPUT_OFF) {
 		output.state = OUTPUT_OFF;
 	}
@@ -476,7 +534,13 @@ static void process_audg(u8_t *pkt, int len) {
 
 	LOG_DEBUG("audg gainL: %u gainR: %u adjust: %u", audg->gainL, audg->gainR, audg->adjust);
 
-	set_volume(audg->adjust ? audg->gainL : FIXED_ONE, audg->adjust ? audg->gainR : FIXED_ONE);
+#if CONFIG_MNCAST_SENDSPIN
+    lms_gain_left = audg->adjust ? audg->gainL : FIXED_ONE;
+    lms_gain_right = audg->adjust ? audg->gainR : FIXED_ONE;
+    set_volume_owned(0, lms_gain_left, lms_gain_right);
+#else
+    set_volume(audg->adjust ? audg->gainL : FIXED_ONE, audg->adjust ? audg->gainR : FIXED_ONE);
+#endif
 }
 
 static void process_dsco(u8_t *pkt, int len) {
@@ -901,13 +965,10 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 	}
 
 	if (!slimproto_ip) {
-#if EMBEDDED        
-        // on first attempt, try really hard to connect before exiting (and only exit if we are not on another sink)
-		slimproto_ip = discover_server(server, MAX_SERVER_RETRIES * 5);
-        if (!slimproto_ip && !output.external) return;
-#else        
-    	slimproto_ip = discover_server(server, 0);
-#endif    
+		// An absent LMS must not return to the embedded reboot/recovery path.
+		// Other sinks run in their own tasks and remain usable during discovery.
+		// As on desktop, keep discovering until a server arrives or shutdown.
+		slimproto_ip = discover_server(server, 0);
 	}
 
 	if (!slimproto_port) {
@@ -991,11 +1052,16 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 			}
 
 #if EMBEDDED
-			// in embedded we give up after a while no matter what
-			if (++failed_connect > MAX_SERVER_RETRIES && !server) {
-				slimproto_ip = serv_addr.sin_addr.s_addr = discover_server(NULL, MAX_SERVER_RETRIES);
-				if (!slimproto_ip && !output.external) return;
-			} else if (reconnect && MAX_SERVER_RETRIES && failed_connect > 5 * MAX_SERVER_RETRIES && !output.external) return;
+			// Periodically rediscover an automatically selected server.
+			if (++failed_connect >= MAX_SERVER_RETRIES && !server &&
+				failed_connect % MAX_SERVER_RETRIES == 0) {
+				in_addr_t discovered = discover_server(NULL, MAX_SERVER_RETRIES);
+				// Keep retrying the last known address when UDP discovery times out.
+				if (discovered) slimproto_ip = serv_addr.sin_addr.s_addr = discovered;
+			}
+			// Upstream PR589: returning schedules a reboot and can eventually
+			// latch recovery merely because LMS is offline. Keep retrying.
+			// Do not restart healthy native Ethernet: RAOP/Spotify may use it.
 #else
 			// rediscover server if it was not set at startup or exit 
 			if (!server && ++failed_connect > 5) {
@@ -1009,6 +1075,9 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 			socklen_t len;
 
 			LOG_INFO("connected");
+#ifdef EMBEDDED
+			halSTORAGE_RebootCounterUpdate(0);
+#endif
 
 			var_cap[0] = '\0';
 			failed_connect = 0;

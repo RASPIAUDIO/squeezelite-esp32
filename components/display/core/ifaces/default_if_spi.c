@@ -12,6 +12,7 @@
 #include <string.h>
 #include <driver/spi_master.h>
 #include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "gds.h"
 #include "gds_err.h"

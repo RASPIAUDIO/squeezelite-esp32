@@ -35,7 +35,6 @@
 #include "esp_attr.h"
 #include "soc/uart_struct.h"
 #include "driver/uart.h"
-#include "config.h"
 #include "nvs_utilities.h"
 #include "platform_esp32.h"
 #include "messaging.h"
@@ -125,7 +124,7 @@ void init_telnet(){
 	vfs.open = &stdout_open;
 	vfs.fstat = &stdout_fstat;
 
-	if (bMirrorToUART) uart_fd = open("/dev/console", O_RDWR);
+	if (bMirrorToUART) uart_fd = open("/dev/uart/0", O_RDWR);
 
 	ESP_ERROR_CHECK(esp_vfs_register("/dev/pkspstdout", &vfs, NULL));
 	freopen("/dev/pkspstdout", "w", stdout);
@@ -265,7 +264,7 @@ static void handle_telnet_conn() {
 
 		if (FD_ISSET(partnerSocket, &rfds)) { 
 			int len = recv(partnerSocket, pTelnetUserData->rxbuf, TELNET_RX_BUF, 0);
-			if (len <= 0) break;
+			if (!len) break;
 			telnet_recv(tnHandle, pTelnetUserData->rxbuf, len);
 		}
 
@@ -288,13 +287,10 @@ static void handle_telnet_conn() {
 
 // ******************* stdout/stderr Redirection to ringbuffer
 static ssize_t stdout_write(int fd, const void * data, size_t size) {
-	// Keep the process-wide stdout hook non-blocking and stack-light.  In
-	// particular, this function can be called by ESP-IDF's timer and event-loop
-	// tasks, whose stacks are sized for system callbacks rather than socket I/O.
-	// The dedicated telnet task drains the ring buffer via process_logs().
-	// If the buffer is full, drop this write rather than blocking a system task.
+	// flush the buffer and send item
 	if (buf_handle) {
-		(void) xRingbufferSend(buf_handle, data, size, 0);
+		process_logs(size, true);
+		xRingbufferSend(buf_handle, data, size, 0);
 	}
 	
 	// mirror to uart if required
@@ -306,7 +302,6 @@ static int stdout_open(const char * path, int flags, int mode) {
 }
 
 static int stdout_fstat(int fd, struct stat * st) {
-    memset(st, 0, sizeof(*st));
 	st->st_mode = S_IFCHR;
 	return 0;
 }

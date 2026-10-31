@@ -10,6 +10,10 @@
  */
 #include "squeezelite.h"
 #include "equalizer.h"
+#include <math.h>
+#if CONFIG_MNCAST_SENDSPIN
+#include "sendspin_sink.h"
+#endif
 
 extern struct outputstate output;
 extern struct buffer *outputbuf;
@@ -126,11 +130,48 @@ void set_volume(unsigned left, unsigned right) {
     equalizer_set_volume(left, right);
 }
 
+#if CONFIG_MNCAST_SENDSPIN
+bool set_volume_owned(int source, unsigned left, unsigned right) {
+    LOCK;
+    if (output.external != source) {
+        UNLOCK;
+        return false;
+    }
+    if (!volume_cb || !(*volume_cb)(left, right)) {
+        output.gainL = left;
+        output.gainR = right;
+    }
+    equalizer_set_volume(left, right);
+    UNLOCK;
+    return true;
+}
+
+bool mn_sendspin_volume_epoch(uint32_t epoch, uint8_t percent, bool muted) {
+    if (percent > 100) return false;
+    unsigned nominal = (unsigned)(65536 * powf(percent / 100.0f, 3));
+    unsigned applied = muted ? 0 : nominal;
+    LOCK;
+    if (!epoch || epoch != mn_sendspin_output_epoch || output.external != MN_SENDSPIN_SOURCE_ID) {
+        UNLOCK;
+        return false;
+    }
+    if (!volume_cb || !(*volume_cb)(applied, applied)) {
+        output.gainL = applied;
+        output.gainR = applied;
+    }
+    // A mute gates the sound; it is not a request for maximum loudness boost.
+    // Keep the previous loudness curve while muted (also at volume zero).
+    if (!muted && nominal) equalizer_set_volume(nominal, nominal);
+    UNLOCK;
+    return true;
+}
+#endif
+
 bool test_open(const char *device, unsigned rates[], bool userdef_rates) {
 	memset(rates, 0, MAX_SUPPORTED_SAMPLERATES * sizeof(unsigned));
 	if (!strcasecmp(device, "I2S")) {
 		unsigned _rates[] = { 
-#if BYTES_PER_FRAME == 4		
+#if BYTES_PER_FRAME == 4 && !CONFIG_MNCAST_S31_COREBOARD
 							  192000, 176400, 
 #endif		
 							  96000, 88200, 48000, 

@@ -10,6 +10,14 @@
 #include "hsm.h"
 #include "esp_log.h"
 #include "network_services.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 6
+// IDF 6 names the same IEEE 802.11 reason values explicitly.
+#define WIFI_REASON_ASSOC_EXPIRE WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY
+#define WIFI_REASON_NOT_AUTHED WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA
+#define WIFI_REASON_NOT_ASSOCED WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA
+#define WIFI_BW_HT20 WIFI_BW20
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -286,7 +294,8 @@ cJSON * network_manager_clear_ap_list_json(cJSON **old);
 /**
  * @brief A standard wifi event handler as recommended by Espressif
  */
-esp_err_t network_manager_event_handler(void *ctx, system_event_t *event);
+// Obsolete in ESP-IDF 5.x - event system changed
+// esp_err_t network_manager_event_handler(void *ctx, system_event_t *event);
 
 
 
@@ -312,7 +321,7 @@ void network_manager_initialise_mdns();
 bool network_is_wifi_prioritized();
 void network_set_timer(uint16_t duration, const char * tag);
 void network_set_hostname(esp_netif_t * netif);
-esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_info_t* ipInfo);
+esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, esp_netif_ip_info_t* ipInfo);
 void network_start_stop_dhcp_client(esp_netif_t* netif, bool start);
 void network_start_stop_dhcps(esp_netif_t* netif, bool start);
 void network_prioritize_wifi(bool activate);

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "esp_system.h"
@@ -71,7 +72,7 @@ static void task_stats( cJSON* top ) {
 	for(int i = 0, n = 0; i < current.n; i++ ) {
 		for (int j = 0; j < previous.n; j++) {
 			if (current.tasks[i].xTaskNumber == previous.tasks[j].xTaskNumber) {
-				n += snprintf(scratch + n, SCRATCH_SIZE - n, "%16s (%u) %2u%% s:%5u", current.tasks[i].pcTaskName,
+				n += snprintf(scratch + n, SCRATCH_SIZE - n, "%16s (%u) %2" PRIu32 "%% s:%5" PRIu32, current.tasks[i].pcTaskName,
 																		   current.tasks[i].eCurrentState,
 																		   100 * (current.tasks[i].ulRunTimeCounter - previous.tasks[j].ulRunTimeCounter) / elapsed,
 																		   current.tasks[i].usStackHighWaterMark);
@@ -281,7 +282,7 @@ void monitor_svc_init(void) {
 
     // pseudo-idle callback => don't use FreeRTOS idle callbacks so we can block (should not but ...)
 	StaticTask_t* xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-	static EXT_RAM_ATTR StackType_t xStack[PSEUDO_IDLE_STACK_SIZE] __attribute__ ((aligned (4)));
+	static EXT_RAM_BSS_ATTR StackType_t xStack[PSEUDO_IDLE_STACK_SIZE] __attribute__ ((aligned (4)));
 	xTaskCreateStatic( (TaskFunction_t) pseudo_idle, "pseudo_idle", PSEUDO_IDLE_STACK_SIZE,
 						NULL, ESP_TASK_PRIO_MIN, xStack, xTaskBuffer );
 }

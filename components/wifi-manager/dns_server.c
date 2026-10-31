@@ -79,7 +79,7 @@ void  dns_server(void *pvParameters) {
     esp_netif_t * netif = (esp_netif_t * )pvParameters;
     /* Set redirection DNS hijack to the access point IP */
     ip4_addr_t ip_resolved;
-    inet_pton(AF_INET, DEFAULT_AP_IP, &ip_resolved);
+    /* Answer with the configured AP address, not a hard-coded default. */
 
 
     /* Create UDP socket */
@@ -97,6 +97,7 @@ void  dns_server(void *pvParameters) {
         ESP_LOGE(TAG, "Failed to get adapter info for udp: %s", esp_err_to_name(esp_err));
         exit(1);
     }
+    ip_resolved.addr = ip_info.ip.addr;
     ra.sin_family = AF_INET;
     ra.sin_addr.s_addr = ip_info.ip.addr;
     ra.sin_port = htons(53);

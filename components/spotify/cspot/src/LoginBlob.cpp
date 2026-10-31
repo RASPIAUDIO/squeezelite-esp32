@@ -2,6 +2,7 @@
 
 #include <stdio.h>           // for sprintf
 #include <initializer_list>  // for initializer_list
+#include <stdexcept>
 
 #include "BellLogger.h"                  // for AbstractLogger
 #include "ConstantParameters.h"          // for brandName, cspot, protoc...
@@ -31,6 +32,7 @@ LoginBlob::LoginBlob(std::string name) {
 std::vector<uint8_t> LoginBlob::decodeBlob(
     const std::vector<uint8_t>& blob, const std::vector<uint8_t>& sharedKey) {
   // 0:16 - iv; 17:-20 - blob; -20:0 - checksum
+  if (blob.size() <= 36) throw std::invalid_argument("Truncated ZeroConf blob");
   auto iv = std::vector<uint8_t>(blob.begin(), blob.begin() + 16);
   auto encrypted = std::vector<uint8_t>(blob.begin() + 16, blob.end() - 20);
   auto checksum = std::vector<uint8_t>(blob.end() - 20, blob.end());
@@ -56,7 +58,7 @@ std::vector<uint8_t> LoginBlob::decodeBlob(
 
   // Check checksum
   if (mac != checksum) {
-    CSPOT_LOG(error, "Mac doesn't match!");
+    throw std::invalid_argument("ZeroConf blob checksum mismatch");
   }
 
   encryptionKey =
@@ -67,12 +69,14 @@ std::vector<uint8_t> LoginBlob::decodeBlob(
 }
 
 uint32_t LoginBlob::readBlobInt(const std::vector<uint8_t>& data) {
+  if (blobSkipPosition >= data.size()) throw std::invalid_argument("Truncated credential integer");
   auto lo = data[blobSkipPosition];
   if ((int)(lo & 0x80) == 0) {
     this->blobSkipPosition += 1;
     return lo;
   }
 
+  if (data.size()-blobSkipPosition < 2) throw std::invalid_argument("Truncated credential integer");
   auto hi = data[blobSkipPosition + 1];
   this->blobSkipPosition += 2;
 
@@ -84,6 +88,8 @@ std::vector<uint8_t> LoginBlob::decodeBlobSecondary(
     const std::string& deviceId) {
   auto encryptedString = std::string(blob.begin(), blob.end());
   auto blobData = crypto->base64Decode(encryptedString);
+  if (blobData.size()<16 || blobData.size()%16)
+    throw std::invalid_argument("Invalid credential block length");
 
   crypto->sha1Init();
   crypto->sha1Update(std::vector<uint8_t>(deviceId.begin(), deviceId.end()));
@@ -101,8 +107,8 @@ std::vector<uint8_t> LoginBlob::decodeBlobSecondary(
 
   auto l = blobData.size();
 
-  for (int i = 0; i < l - 16; i++) {
-    blobData[l - i - 1] ^= blobData[l - i - 17];
+  for (size_t i=l; i>16; --i) {
+    blobData[i-1] ^= blobData[i-17];
   }
 
   return blobData;
@@ -117,16 +123,27 @@ void LoginBlob::loadZeroconf(const std::vector<uint8_t>& blob,
   auto loginData = this->decodeBlobSecondary(partDecoded, username, deviceId);
 
   // Parse blob
-  blobSkipPosition = 1;
-  blobSkipPosition += readBlobInt(loginData);
-  blobSkipPosition += 1;
-  this->authType = readBlobInt(loginData);
-  blobSkipPosition += 1;
+  auto advance = [&](size_t count) {
+    if (blobSkipPosition>loginData.size() || count>loginData.size()-blobSkipPosition)
+      throw std::invalid_argument("Truncated credential field");
+    blobSkipPosition+=count;
+  };
+  blobSkipPosition = 0;
+  advance(1);
+  auto userSize = readBlobInt(loginData);
+  advance(userSize);
+  advance(1);
+  auto newAuthType = readBlobInt(loginData);
+  advance(1);
   auto authSize = readBlobInt(loginData);
+  if (!authSize || authSize>loginData.size()-blobSkipPosition)
+    throw std::invalid_argument("Invalid credential payload length");
+  auto newAuthData = std::vector<uint8_t>(loginData.begin()+blobSkipPosition,
+                                        loginData.begin()+blobSkipPosition+authSize);
+  // Do not replace an existing identity when a new blob is rejected.
   this->username = username;
-  this->authData =
-      std::vector<uint8_t>(loginData.begin() + blobSkipPosition,
-                           loginData.begin() + blobSkipPosition + authSize);
+  this->authType = newAuthType;
+  this->authData = std::move(newAuthData);
 }
 
 void LoginBlob::loadUserPass(const std::string& username,
@@ -139,7 +156,7 @@ void LoginBlob::loadUserPass(const std::string& username,
 
 void LoginBlob::loadJson(const std::string& json) {
 #ifdef BELL_ONLY_CJSON
-  cJSON* root = cJSON_ParseWithLength(json.c_str(), json.size());
+  cJSON* root = cJSON_Parse(json.c_str());
   this->authType = cJSON_GetObjectItem(root, "authType")->valueint;
   this->username = cJSON_GetObjectItem(root, "username")->valuestring;
   std::string authDataObject =
@@ -183,14 +200,17 @@ std::string LoginBlob::toJson() {
 void LoginBlob::loadZeroconfQuery(
     std::map<std::string, std::string>& queryParams) {
   // Get all urlencoded params
-  auto username = queryParams["userName"];
-  auto blobString = queryParams["blob"];
-  auto clientKeyString = queryParams["clientKey"];
-  auto deviceName = queryParams["deviceName"];
+  const auto& username = queryParams.at("userName");
+  const auto& blobString = queryParams.at("blob");
+  const auto& clientKeyString = queryParams.at("clientKey");
+  if (username.empty() || blobString.empty() || clientKeyString.empty())
+    throw std::invalid_argument("Missing ZeroConf credentials");
 
   // client key and bytes are urlencoded
   auto clientKeyBytes = crypto->base64Decode(clientKeyString);
   auto blobBytes = crypto->base64Decode(blobString);
+  if (clientKeyBytes.empty() || clientKeyBytes.size()>DH_KEY_SIZE || blobBytes.size()<=36)
+    throw std::invalid_argument("Invalid ZeroConf key or blob length");
 
   // Generated secret based on earlier generated DH
   auto secretKey = crypto->dhCalculateShared(clientKeyBytes);

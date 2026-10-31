@@ -1,0 +1,165 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include "sendspin/client.h"
+#include "sendspin/config.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+
+#include <ftxui/component/screen_interactive.hpp>
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace sendspin {
+
+/// @brief A discovered Sendspin server from mDNS browsing.
+struct DiscoveredServer {
+    std::string name;  ///< Friendly server name from mDNS
+    std::string host;  ///< Resolved IP address or hostname
+    uint16_t port{0};  ///< Server port
+    std::string path;  ///< WebSocket path from TXT record (e.g., "/sendspin")
+};
+
+/// @brief PlayerRole setter calls the key handler hands to the client thread.
+///
+/// PlayerRole::update_volume(), update_muted() and update_output_delay() are main-loop only, and
+/// the key handler runs on the FTXUI thread. Each field is the value the client thread applies on
+/// its next iteration; latest keypress wins.
+struct PendingPlayerCommands {
+    std::optional<uint8_t> volume;
+    std::optional<bool> muted;
+    std::optional<uint16_t> output_delay_ms;
+};
+
+/// @brief Shared state between SendspinClient callbacks and the TUI render thread.
+/// All fields are protected by the mutex.
+struct TuiState {
+    mutable std::mutex mutex;
+
+    // Metadata
+    std::string title;
+    std::string artist;
+    std::string album;
+
+    // Volume
+    uint8_t group_volume{0};
+    uint8_t player_volume{0};
+    bool group_muted{false};
+    bool player_muted{false};
+
+    // Progress
+    uint32_t track_progress_ms{0};
+    uint32_t track_duration_ms{0};
+    std::chrono::steady_clock::time_point progress_updated_at;
+
+    // Playback
+    SendspinRepeatMode repeat_mode{SendspinRepeatMode::OFF};
+    bool shuffle{false};
+    SendspinPlaybackState playback_state{SendspinPlaybackState::STOPPED};
+
+    // Stream info
+    std::optional<SendspinCodecFormat> codec;
+    std::optional<uint32_t> sample_rate;
+    std::optional<uint8_t> bit_depth;
+    std::optional<uint8_t> channels;
+    uint16_t output_delay_ms{0};
+
+    // Connection
+    bool connected{false};
+    bool time_synced{false};
+    std::string group_name;
+    bool streaming{false};
+    std::string connected_host;
+    uint16_t connected_port{0};
+
+    // Identity and trust
+    std::string client_id;
+    ConnectionTrust trust{ConnectionTrust::NONE};
+    std::string pairing_status;  // brief human-readable pairing event description
+    std::string pairing_token;   // formatted Pairing PSK token (SP:...); empty if unavailable
+
+    // Server selector
+    bool server_selector_active{false};
+    int server_selector_index{0};
+    std::vector<DiscoveredServer> discovered_servers;
+
+    // Shortcut highlight feedback
+    std::string highlighted_label;
+    std::chrono::steady_clock::time_point highlight_expire;
+
+    // Visualizer
+    bool visualizer_active{false};
+    uint16_t vis_loudness{0};
+    uint16_t vis_peak_freq{0};
+    std::vector<uint16_t> vis_spectrum;         // raw target values from server
+    std::vector<float> vis_display_spectrum;     // smoothed display values (decay toward target)
+    float vis_display_loudness{0.0f};            // smoothed loudness for display
+    bool vis_beat{false};
+    int64_t vis_beat_expire_us{0};
+    bool vis_peak{false};         // energy-onset (peak) blinker
+    int64_t vis_peak_expire_us{0};
+
+    // Artwork: what the server last delivered per channel, in configuration order
+    struct ArtworkChannelStatus {
+        std::string wanted;       ///< The source, format and size this channel asks for
+        size_t image_bytes{0};    ///< Encoded size of the most recently delivered image, 0 after
+                                  ///< a clear
+        uint32_t images{0};       ///< Images delivered to this channel so far
+    };
+    std::vector<ArtworkChannelStatus> artwork_channels;
+
+    // Colors derived from the current audio, as [R, G, B]. Spelled out rather than using
+    // sendspin::RgbColor so this state depends on no role type and needs no
+    // SENDSPIN_ENABLE_COLOR guard.
+    bool color_received{false};
+    std::optional<std::array<uint8_t, 3>> color_primary;
+    std::optional<std::array<uint8_t, 3>> color_accent;
+    std::optional<std::array<uint8_t, 3>> color_background_dark;
+
+    // Tab state
+    bool show_visualizer{false};
+
+    // Player setters the key handler defers to the client thread
+    PendingPlayerCommands pending_player;
+};
+
+/// @brief Creates the FTXUI component tree with rendering and key handling.
+/// @param client The SendspinClient for sending commands.
+/// @param state Shared TUI state (updated by callbacks and polling).
+/// @param screen The FTXUI screen (needed for Exit on quit).
+/// @return The root FTXUI component.
+ftxui::Component create_tui_component(SendspinClient& client, TuiState& state,
+                                      ftxui::ScreenInteractive& screen);
+
+/// @brief Polls client state that doesn't have callbacks (progress, controller state, etc.).
+/// Called periodically from the background thread.
+void update_polled_state(TuiState& state, SendspinClient& client);
+
+/// @brief Applies the PlayerRole setters the key handler deferred. Client thread only, before
+/// SendspinClient::loop().
+/// @param state Shared TUI state holding the pending values.
+/// @param client The SendspinClient owning the player role.
+void apply_pending_player_commands(TuiState& state, SendspinClient& client);
+
+}  // namespace sendspin

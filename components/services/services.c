@@ -14,8 +14,7 @@
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "driver/i2c.h"
-#include "driver/rmt.h"
+#include "i2c_bus.h"
 #include "platform_config.h"
 #include "gpio_exp.h"
 #include "battery.h"
@@ -35,8 +34,6 @@ int i2c_system_port = I2C_SYSTEM_PORT;
 int i2c_system_speed = 400000;
 int spi_system_host = SPI_SYSTEM_HOST;
 int spi_system_dc_gpio = -1;
-int rmt_system_base_tx_channel = RMT_CHANNEL_0;
-int rmt_system_base_rx_channel = RMT_CHANNEL_MAX-1;
 
 pwm_system_t pwm_system = {
 		.timer = LEDC_TIMER_0,
@@ -44,7 +41,7 @@ pwm_system_t pwm_system = {
 		.max = (1 << LEDC_TIMER_13_BIT),
 };
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
     uint64_t wake_gpio, wake_level;
     uint64_t rtc_gpio, rtc_level;
     uint32_t delay, spurious;
@@ -68,11 +65,11 @@ void set_chip_power_gpio(int gpio, char *value) {
 	if (gpio >= GPIO_NUM_MAX) return;
 
 	if (!strcasecmp(value, "vcc") ) {
-		gpio_pad_select_gpio(gpio);
+		esp_rom_gpio_pad_select_gpio(gpio);
 		gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
 		gpio_set_level(gpio, 1);
 	} else if (!strcasecmp(value, "gnd")) {
-		gpio_pad_select_gpio(gpio);
+		esp_rom_gpio_pad_select_gpio(gpio);
 		gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
 		gpio_set_level(gpio, 0);
 	} else parsed = false;
@@ -111,7 +108,7 @@ static void sleep_gpio_handler(void *id, button_event_e event, button_press_e mo
  *
  */
 static void sleep_timer(uint32_t now) {
-    static EXT_RAM_ATTR uint32_t last, first;
+    static EXT_RAM_BSS_ATTR uint32_t last, first;
 
     // first chain the calls to pseudo_idle function
     if (sleep_context.idle_chain) sleep_context.idle_chain(now);
@@ -276,6 +273,14 @@ void services_sleep_init(void) {
 /****************************************************************************************
  *
  */
+// Timer callback wrapper for esp_deep_sleep_start
+static void sleep_timer_callback(TimerHandle_t xTimer) {
+    esp_deep_sleep_start();
+}
+
+/****************************************************************************************
+ *
+ */
 void services_sleep_activate(sleep_cause_e cause) {
     // call all sleep hooks that might want to do something
     for (void (**suspend)(void) = sleep_context.suspend; *suspend; suspend++) (*suspend)();
@@ -303,7 +308,7 @@ void services_sleep_activate(sleep_cause_e cause) {
     // is there just one GPIO
     if (sleep_context.wake_gpio & (sleep_context.wake_gpio - 1)) {
         ESP_LOGI(TAG, "going to sleep cause %d, wake-up on multiple GPIO, any '1' wakes up 0x%llx", cause, sleep_context.wake_gpio);
-#if defined(CONFIG_IDF_TARGET_ESP32S3) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+#if (defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S31)) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
         if (!sleep_context.wake_level) esp_sleep_enable_ext1_wakeup(sleep_context.wake_gpio, ESP_EXT1_WAKEUP_ANY_LOW);
         else
 #endif
@@ -312,13 +317,18 @@ void services_sleep_activate(sleep_cause_e cause) {
         int gpio = __builtin_ctzll(sleep_context.wake_gpio);
         int level = (sleep_context.wake_level >> gpio) & 0x01;
         ESP_LOGI(TAG, "going to sleep cause %d, wake-up on GPIO %d level %d", cause, gpio, level);
+#if SOC_PM_SUPPORT_EXT0_WAKEUP
         esp_sleep_enable_ext0_wakeup(gpio, level);
+#else
+        esp_sleep_enable_ext1_wakeup(sleep_context.wake_gpio,
+            level ? ESP_EXT1_WAKEUP_ANY_HIGH : ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
     } else {
         ESP_LOGW(TAG, "going to sleep cause %d, no wake-up option", cause);
     }
 
     // we need to use a timer in case the same button is used for sleep and wake-up and it's "pressed" vs "released" selected
-    if (cause == SLEEP_ONKEY) xTimerStart(xTimerCreate("sleepTimer", pdMS_TO_TICKS(1000), pdFALSE, NULL, (void (*)(void*)) esp_deep_sleep_start), 0);
+    if (cause == SLEEP_ONKEY) xTimerStart(xTimerCreate("sleepTimer", pdMS_TO_TICKS(1000), pdFALSE, NULL, sleep_timer_callback), 0);
     else esp_deep_sleep_start();
 }
 
@@ -364,13 +374,16 @@ void services_init(void) {
 	// set potential power GPIO on chip first in case expanders are powered using these
 	parse_set_GPIO(set_chip_power_gpio);
 
-	// shared I2C bus
+	// shared I2C bus using new i2c_master driver
 	const i2c_config_t * i2c_config = config_i2c_get(&i2c_system_port);
-	ESP_LOGI(TAG,"Configuring I2C sda:%d scl:%d port:%u speed:%u", i2c_config->sda_io_num, i2c_config->scl_io_num, i2c_system_port, i2c_config->master.clk_speed);
+	ESP_LOGI(TAG,"Configuring I2C sda:%d scl:%d port:%u speed:%d", i2c_config->sda_io_num, i2c_config->scl_io_num, i2c_system_port, i2c_config->master.clk_speed);
 
 	if (i2c_config->sda_io_num != -1 && i2c_config->scl_io_num != -1) {
-		i2c_param_config(i2c_system_port, i2c_config);
-		i2c_driver_install(i2c_system_port, i2c_config->mode, 0, 0, 0 );
+		esp_err_t ret = i2c_bus_init(i2c_system_port, i2c_config->sda_io_num, i2c_config->scl_io_num, i2c_config->master.clk_speed);
+		if (ret != ESP_OK) {
+			i2c_system_port = -1;
+			ESP_LOGE(TAG, "Failed to initialize I2C bus: %s", esp_err_to_name(ret));
+		}
 	} else {
 		i2c_system_port = -1;
 		ESP_LOGW(TAG, "no I2C configured");
@@ -404,7 +417,7 @@ void services_init(void) {
 	ledc_timer_config_t pwm_timer = {
 		.duty_resolution = LEDC_TIMER_13_BIT,
 		.freq_hz = 5000,
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#if !SOC_LEDC_SUPPORT_HS_MODE
         .speed_mode = LEDC_LOW_SPEED_MODE,
 #else
 		.speed_mode = LEDC_HIGH_SPEED_MODE,

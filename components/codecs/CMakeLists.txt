@@ -1,3 +1,8 @@
+if(IDF_TARGET STREQUAL "esp32s31")
+    include("${CMAKE_CURRENT_LIST_DIR}/s31-codecs.cmake")
+    return()
+endif()
+
 idf_component_register(
 	   INCLUDE_DIRS . ./inc inc/alac inc/helix-aac inc/mad inc/resample16 inc/soxr inc/vorbis inc/opus
 )

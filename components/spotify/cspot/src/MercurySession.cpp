@@ -1,4 +1,5 @@
 #include "MercurySession.h"
+#include <chrono>
 
 #include <string.h>     // for memcpy
 #include <memory>       // for shared_ptr
@@ -20,6 +21,11 @@
 #include "Utils.h"              // for extract, pack, hton64
 
 using namespace cspot;
+
+static uint64_t audioKeyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 MercurySession::MercurySession(std::shared_ptr<TimeProvider> timeProvider)
     : bell::Task("mercury_dispatcher", 4 * 1024, 3, 1) {
@@ -51,6 +57,8 @@ void MercurySession::runTask() {
       }
     } catch (const std::runtime_error& e) {
       CSPOT_LOG(error, "Error while receiving packet: %s", e.what());
+      isReconnecting = true;
+      abortAudioKeys();
       failAllPending();
 
       if (!isRunning)
@@ -63,27 +71,29 @@ void MercurySession::runTask() {
 }
 
 void MercurySession::reconnect() {
-  std::scoped_lock lock(connectingMutex);
+  isReconnecting = true;
 
-  while (isRunning) {
-    try {
-      this->conn = nullptr;
-      this->shanConn = nullptr;
+  try {
+    this->conn = nullptr;
+    this->shanConn = nullptr;
 
-      this->connectWithRandomAp();
-      this->authenticate(this->authBlob);
+    this->connectWithRandomAp();
+    this->authenticate(this->authBlob);
 
-      CSPOT_LOG(info, "Reconnection successful");
+    CSPOT_LOG(info, "Reconnection successful");
 
-      BELL_SLEEP_MS(100);
+    BELL_SLEEP_MS(100);
 
-      lastPingTimestamp = timeProvider->getSyncedTimestamp();
+    lastPingTimestamp = timeProvider->getSyncedTimestamp();
+    isReconnecting = false;
 
-      this->executeEstabilishedCallback = true;
-      break;
-    } catch (...) {
-      CSPOT_LOG(error, "Cannot reconnect, will retry in 5s");
-      BELL_SLEEP_MS(5000);
+    this->executeEstabilishedCallback = true;
+  } catch (...) {
+    CSPOT_LOG(error, "Cannot reconnect, will retry in 5s");
+    BELL_SLEEP_MS(5000);
+
+    if (isRunning) {
+      return reconnect();
     }
   }
 }
@@ -115,22 +125,15 @@ void MercurySession::unregister(uint64_t sequenceId) {
 }
 
 void MercurySession::unregisterAudioKey(uint32_t sequenceId) {
-  auto callback = this->audioKeyCallbacks.find(sequenceId);
-
-  if (callback != this->audioKeyCallbacks.end()) {
-    this->audioKeyCallbacks.erase(callback);
-  }
+  std::scoped_lock lock(audioKeyMutex);
+  audioKeys.cancel(sequenceId);
 }
 
 void MercurySession::disconnect() {
   CSPOT_LOG(info, "Disconnecting mercury session");
   this->isRunning = false;
-
-  // make sure we have a connection or are not reconnecting
-  std::unique_lock connlock(connectingMutex);
-  if (conn) conn->close();
-  connlock.unlock();
-
+  abortAudioKeys();
+  conn->close();
   std::scoped_lock lock(this->isRunningMutex);
 }
 
@@ -140,6 +143,8 @@ std::string MercurySession::getCountryCode() {
 
 void MercurySession::handlePacket() {
   Packet packet = {};
+
+  dispatchAudioKeys();
 
   this->packetQueue.wtpop(packet, 200);
 
@@ -160,13 +165,41 @@ void MercurySession::handlePacket() {
     case RequestType::AUDIO_KEY_SUCCESS_RESPONSE: {
       // this->lastRequestTimestamp = -1;
 
+      if (packet.data.size() < sizeof(uint32_t)) {
+        CSPOT_LOG(error, "Truncated audio-key response: %u bytes",
+                  static_cast<unsigned>(packet.data.size()));
+        break;
+      }
+      if (static_cast<RequestType>(packet.command) ==
+          RequestType::AUDIO_KEY_FAILURE_RESPONSE) {
+        // Error bytes only: never log a successful key or the packet payload.
+        if (packet.data.size() >= 6) {
+          CSPOT_LOG(error, "Audio-key server refusal: code=%u,%u bytes=%u",
+                    static_cast<unsigned>(packet.data[4]),
+                    static_cast<unsigned>(packet.data[5]),
+                    static_cast<unsigned>(packet.data.size()));
+        } else {
+          CSPOT_LOG(error, "Audio-key server refusal: no error code, bytes=%u",
+                    static_cast<unsigned>(packet.data.size()));
+        }
+      }
+
       // First four bytes mark the sequence id
       auto seqId = ntohl(extract<uint32_t>(packet.data, 0));
 
-      if (this->audioKeyCallbacks.count(seqId) > 0) {
-        auto success = static_cast<RequestType>(packet.command) ==
-                       RequestType::AUDIO_KEY_SUCCESS_RESPONSE;
-        this->audioKeyCallbacks[seqId](success, packet.data);
+      const auto success = static_cast<RequestType>(packet.command) ==
+                           RequestType::AUDIO_KEY_SUCCESS_RESPONSE;
+      AudioKeyRequests::Event event;
+      {
+        std::scoped_lock lock(audioKeyMutex);
+        event = audioKeys.reply(seqId, success, packet.data, audioKeyNowMs());
+      }
+      if (event.kind == AudioKeyRequests::Kind::Retry) {
+        CSPOT_LOG(info, "Audio-key retry: attempt %u/4 in %u ms",
+                  event.attempt, static_cast<unsigned>(event.waitMs));
+      }
+      if (event.callback) {
+        event.callback(event.success, event.response);
       }
 
       break;
@@ -251,11 +284,6 @@ uint64_t MercurySession::executeSubscription(RequestType method,
                                              ResponseCallback callback,
                                              ResponseCallback subscription,
                                              DataParts& payload) {
-
-  // make sure we are not reconnecting or stopped
-  std::scoped_lock lock(connectingMutex);
-  if (!isRunning) return 0;
-
   CSPOT_LOG(debug, "Executing Mercury Request, type %s",
             RequestTypeMap[method].c_str());
 
@@ -327,33 +355,45 @@ uint64_t MercurySession::executeSubscription(RequestType method,
 uint32_t MercurySession::requestAudioKey(const std::vector<uint8_t>& trackId,
                                          const std::vector<uint8_t>& fileId,
                                          AudioKeyCallback audioCallback) {
-  auto buffer = fileId;
+  std::scoped_lock lock(audioKeyMutex);
+  if (!isRunning || isReconnecting) return 0;
+  return audioKeys.add(trackId, fileId, std::move(audioCallback));
+}
 
-  // make sure we are not reconnecting or stopped
-  std::scoped_lock lock(connectingMutex);
-  if (!isRunning) return 0;
-  
-  // Store callback
-  this->audioKeyCallbacks.insert({this->audioKeySequence, audioCallback});
-
-  // Structure: [FILEID] [TRACKID] [4 BYTES SEQUENCE ID] [0x00, 0x00]
-  buffer.insert(buffer.end(), trackId.begin(), trackId.end());
-  auto audioKeySequenceBuffer = pack<uint32_t>(htonl(this->audioKeySequence));
-  buffer.insert(buffer.end(), audioKeySequenceBuffer.begin(),
-                audioKeySequenceBuffer.end());
-  auto suffix = std::vector<uint8_t>({0x00, 0x00});
-  buffer.insert(buffer.end(), suffix.begin(), suffix.end());
-
-  // Bump audio key sequence
-  this->audioKeySequence += 1;
-
-  // Used for broken connection detection
-  // this->lastRequestTimestamp = timeProvider->getSyncedTimestamp();
-  try {
-    this->shanConn->sendPacket(
-        static_cast<uint8_t>(RequestType::AUDIO_KEY_REQUEST_COMMAND), buffer);
-  } catch (...) {
-    // @TODO: Handle disconnect
+void MercurySession::abortAudioKeys() {
+  std::vector<AudioKeyRequests::Event> events;
+  {
+    std::scoped_lock lock(audioKeyMutex);
+    events = audioKeys.abort();
   }
-  return audioKeySequence - 1;
+  for (auto& event : events) {
+    if (event.callback) event.callback(false, {});
+  }
+}
+
+void MercurySession::dispatchAudioKeys() {
+  AudioKeyRequests::Event event;
+  {
+    std::scoped_lock lock(audioKeyMutex);
+    if (!isRunning || isReconnecting) return;
+    event = audioKeys.poll(audioKeyNowMs());
+    if (event.kind == AudioKeyRequests::Kind::Send) {
+      CSPOT_LOG(info, "Audio-key request attempt %u/4, file=%u track=%u",
+                event.attempt, static_cast<unsigned>(event.file.size()),
+                static_cast<unsigned>(event.track.size()));
+      auto buffer = event.file;
+      buffer.insert(buffer.end(), event.track.begin(), event.track.end());
+      const auto wire = pack<uint32_t>(htonl(event.wire));
+      buffer.insert(buffer.end(), wire.begin(), wire.end());
+      buffer.push_back(0);
+      buffer.push_back(0);
+      try {
+        shanConn->sendPacket(
+            static_cast<uint8_t>(RequestType::AUDIO_KEY_REQUEST_COMMAND), buffer);
+      } catch (...) {
+        event = audioKeys.sendFailed(event.wire);
+      }
+    }
+  }
+  if (event.callback) event.callback(event.success, event.response);
 }

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <arpa/inet.h>
 #include "esp_log.h"
 #include "globdefs.h"
@@ -17,18 +18,23 @@
 #include "display.h"
 #include "services.h"
 #include "gds.h"
+#include "gds_private.h"
 #include "gds_default_if.h"
 #include "gds_draw.h"
 #include "gds_text.h"
 #include "gds_font.h"
 #include "gds_image.h"
+#include "wifi_setup.h"
 
 static const char *TAG = "display";
+
+// Define global function pointer declared in display.h
+bool (*display_bus)(void *from, enum display_bus_cmd_e cmd) = NULL;
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 
-#define DISPLAYER_STACK_SIZE 	(3*1024)
+#define DISPLAYER_STACK_SIZE 	(6*1024)
 #define SCROLLABLE_SIZE			384
 #define HEADER_SIZE				64
 #define	DEFAULT_SLEEP			3600
@@ -36,7 +42,7 @@ static const char *TAG = "display";
 
 extern const uint8_t default_artwork[]   asm("_binary_note_jpg_start");
 
-static EXT_RAM_ATTR struct {
+static EXT_RAM_BSS_ATTR struct {
 	TaskHandle_t task;
 	SemaphoreHandle_t mutex;
 	int pause, speed, by;
@@ -56,11 +62,40 @@ static EXT_RAM_ATTR struct {
 		bool enable, active;
 		bool fit;
 		bool updated;
+		bool pending_flush;
 		int tick;
 		int offset;
 	}  artwork;
 	TickType_t tick;
 } displayer;
+
+static EXT_RAM_BSS_ATTR struct {
+    bool active, dirty, open;
+    char ssid[33], password[65], ip[16];
+} setup_screen;
+
+void displayer_wifi_setup(const char *ssid, const char *password, const char *ip, bool open) {
+    if (!display || !displayer.mutex || display->Width < 320 || display->Height < 240) return;
+    xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+    if (ssid && password && ip) {
+        strlcpy(setup_screen.ssid, ssid, sizeof(setup_screen.ssid));
+        strlcpy(setup_screen.password, password, sizeof(setup_screen.password));
+        strlcpy(setup_screen.ip, ip, sizeof(setup_screen.ip));
+        setup_screen.open = open;
+        setup_screen.active = setup_screen.dirty = true;
+        displayer.artwork.pending_flush = false;
+        GDS_DisplayOn(display);
+    } else if (setup_screen.active) {
+        memset(&setup_screen, 0, sizeof(setup_screen));
+        displayer.state = DISPLAYER_DOWN;
+        GDS_Clear(display, GDS_COLOR_BLACK);
+        GDS_Update(display);
+        if (display_bus) display_bus(&displayer, DISPLAY_BUS_GIVE);
+        ESP_LOGI(TAG, "Wi-Fi setup screen hidden");
+    }
+    xTaskNotifyGive(displayer.task);
+    xSemaphoreGive(displayer.mutex);
+}
 
 static const char *known_drivers[] = {"SH1106",
         "SH1122",
@@ -78,6 +113,7 @@ static const char *known_drivers[] = {"SH1106",
     
 static void displayer_task(void *args);
 static void display_sleep(void);
+static void displayer_artwork_locked(uint8_t *data);
 
 struct GDS_Device *display;   
 extern GDS_DetectFunc SSD1306_Detect, SSD132x_Detect, SH1106_Detect, SH1122_Detect, SSD1675_Detect, SSD1322_Detect, SSD1351_Detect, ST77xx_Detect, ILI9341_Detect;
@@ -145,7 +181,7 @@ void display_init(char *welcome) {
 	
 	if (init) {
 		static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-		static EXT_RAM_ATTR StackType_t xStack[DISPLAYER_STACK_SIZE] __attribute__ ((aligned (4)));
+		static EXT_RAM_BSS_ATTR StackType_t xStack[DISPLAYER_STACK_SIZE] __attribute__ ((aligned (4)));
 		struct GDS_Layout Layout = {
 			.HFlip = strcasestr(config, "HFlip"), 
 			.VFlip = strcasestr(config, "VFlip"), 
@@ -194,22 +230,34 @@ static void display_sleep(void) {
 }
 
 /****************************************************************************************
- * This is not thread-safe as displayer_task might be in the middle of line drawing
- * but it won't crash (I think) and making it thread-safe would be complicated for a
- * feature which is secondary (the LMS version of scrolling is thread-safe)
+ * Serialize complete draws with activation/shutdown and artwork updates.
+ * The LMS display lock is transferred only after this task has finished drawing.
  */
 static void displayer_task(void *args) {
 	int scroll_sleep = 0, timer_sleep;
 		
 	while (1) {
-		// suspend ourselves if nothing to do
+		xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+        if (setup_screen.active) {
+            if (display_bus) display_bus(&displayer, DISPLAY_BUS_TAKE);
+            if (setup_screen.dirty) {
+                bool ok = wifi_setup_render(display, setup_screen.ssid, setup_screen.password, setup_screen.ip, setup_screen.open);
+                setup_screen.dirty = false;
+                ESP_LOGI(TAG, "Wi-Fi setup screen rendered; QR codes %s", ok ? "ready" : "unavailable");
+            }
+            xSemaphoreGive(displayer.mutex);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
+		// Idle/down no longer owns the display. Never draw after giving it to LMS.
 		if (displayer.state < DISPLAYER_ACTIVE) {
-			if (displayer.state == DISPLAYER_IDLE) GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
-			vTaskSuspend(NULL);
+			xSemaphoreGive(displayer.mutex);
+			// A notification also survives activation between unlock and wait.
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 			scroll_sleep = 0;
-			GDS_ClearExt(display, true);
-			GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_UPDATE, displayer.header);
-		} else if (displayer.refresh) {
+			continue;
+		}
+		if (displayer.refresh) {
 			// little trick when switching master while in IDLE and missing it
 			GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.header);	
 			displayer.refresh = false;			
@@ -219,19 +267,16 @@ static void displayer_task(void *args) {
 		if (scroll_sleep <= 10) {
 			// something to scroll (or we'll wake-up every pause ms ... no big deal)
 			if (*displayer.string && displayer.state == DISPLAYER_ACTIVE) {
-				xSemaphoreTake(displayer.mutex, portMAX_DELAY);
-				
-				// need to work with local copies as we don't want to suspend caller
+
+				// Keep state and rendering under the ownership-transfer mutex.
 				int offset = -displayer.offset;
-				char *string = strdup(displayer.string);
+				char *string = displayer.string;
 				scroll_sleep = displayer.offset ? displayer.speed : displayer.pause;
 				displayer.offset = displayer.offset >= displayer.boundary ? 0 : (displayer.offset + min(displayer.by, displayer.boundary - displayer.offset));			
-				
-				xSemaphoreGive(displayer.mutex);				
-				
-				// now display using safe copies, can be lengthy
+
+
+				// A shutdown waits until this complete draw has finished.
 				GDS_TextLine(display, 2, offset, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, string);
-				free(string);
 			} else {
 				scroll_sleep = DEFAULT_SLEEP;
 			}	
@@ -244,16 +289,15 @@ static void displayer_task(void *args) {
 			uint32_t elapsed = (tick - displayer.tick) * portTICK_PERIOD_MS;
 
 			if (elapsed >= 1000) {
-				xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+
 				displayer.tick = tick;
 				elapsed = displayer.elapsed += elapsed / 1000;
-				xSemaphoreGive(displayer.mutex);
 
 				// when we have duration but no space, display remaining time
 				if (displayer.duration.value && !displayer.duration.visible) elapsed = displayer.duration.value - elapsed;
 
-				if (elapsed < 3600) sprintf(_line, "%u:%02u", elapsed / 60, elapsed % 60);
-				else sprintf(_line, "%u:%02u:%02u", (elapsed / 3600) % 100, (elapsed % 3600) / 60, elapsed % 60);
+				if (elapsed < 3600) sprintf(_line, "%" PRIu32 ":%02" PRIu32, elapsed / 60, elapsed % 60);
+				else sprintf(_line, "%" PRIu32 ":%02" PRIu32 ":%02" PRIu32, (elapsed / 3600) % 100, (elapsed % 3600) / 60, elapsed % 60);
 
 				// concatenate if we have room for elapsed / duration
 				if (displayer.duration.visible) {
@@ -270,24 +314,34 @@ static void displayer_task(void *args) {
 				// if we have not received artwork after 5s, display a default icon
 				if (displayer.artwork.active && !displayer.artwork.updated && tick - displayer.artwork.tick > pdMS_TO_TICKS(5000)) {
 					ESP_LOGI(TAG, "no artwork received, setting default");
-					displayer_artwork((uint8_t*) default_artwork);
+					displayer_artwork_locked((uint8_t*) default_artwork);
 				}	
 				timer_sleep = 1000;
 			} else timer_sleep = max(1000 - elapsed, 0);	
 		} else timer_sleep = DEFAULT_SLEEP;
 		
-		// then sleep the min amount of time
+		// A Sendspin image can arrive without metadata or a running timer.
+		// Flush it from this task, never while holding the audio ownership lock.
+
+		if (displayer.artwork.pending_flush) {
+			if (displayer.state == DISPLAYER_ACTIVE) GDS_Update(display);
+			displayer.artwork.pending_flush = false;
+		}
+
+		// Image delivery wakes this wait; preserve the remaining scroll delay.
 		int sleep = min(scroll_sleep, timer_sleep);
 		ESP_LOGD(TAG, "timers s:%d t:%d", scroll_sleep, timer_sleep);
-		scroll_sleep -= sleep;
-		vTaskDelay(sleep / portTICK_PERIOD_MS);
+		xSemaphoreGive(displayer.mutex);
+		TickType_t wait_start = xTaskGetTickCount();
+		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleep));
+		scroll_sleep -= (xTaskGetTickCount() - wait_start) * portTICK_PERIOD_MS;
 	}
 }	
 
 /****************************************************************************************
  * 
  */
-void displayer_artwork(uint8_t *data) {
+static void displayer_artwork_locked(uint8_t *data) {
 	if (!displayer.artwork.active) return;
 	
 	int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
@@ -303,9 +357,70 @@ void displayer_artwork(uint8_t *data) {
 	
 }
 
+void displayer_artwork(uint8_t *data) {
+    if (!display || !displayer.mutex) return;
+    xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+    if (!setup_screen.active && displayer.state == DISPLAYER_ACTIVE) displayer_artwork_locked(data);
+    xSemaphoreGive(displayer.mutex);
+}
+
 /****************************************************************************************
  * 
  */
+typedef struct {
+    uint8_t *pixels;
+    int width, height, mode;
+} prepared_image_t;
+
+void *displayer_image_decode(const uint8_t *data, size_t length) {
+    // Network artwork currently targets framebuffer colour displays only.
+    if (!display || !display->Framebuffer || display->Mode != GDS_RGB565 ||
+        display->DrawRGB || display->ClearWindow || !displayer.mutex) return NULL;
+    xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+    int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
+    int y = x ? 0 : 32;
+    int width = min(208, display->Width - x), height = min(208, display->Height - y);
+    int mode = display->Mode;
+    xSemaphoreGive(displayer.mutex);
+    prepared_image_t *image = calloc(1, sizeof(*image));
+    if (!image) return NULL;
+    image->mode = mode;
+    image->pixels = GDS_DecodeJPEGBounded(data, length, &image->width, &image->height, width, height, mode);
+    if (!image->pixels) { free(image); return NULL; }
+    return image;
+}
+
+void displayer_image_free(void *ptr) {
+    prepared_image_t *image = ptr;
+    if (image) { free(image->pixels); free(image); }
+}
+
+bool displayer_image_show(void *ptr) {
+    prepared_image_t *image = ptr;
+    if (!display || !display->Framebuffer || display->Mode != GDS_RGB565 ||
+        display->DrawRGB || display->ClearWindow || !displayer.mutex ||
+        xSemaphoreTake(displayer.mutex, 0) != pdTRUE) return false;
+    bool ok = !setup_screen.active && displayer.artwork.active && displayer.state == DISPLAYER_ACTIVE;
+    int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
+    int y = x ? 0 : 32;
+    if (image && (image->mode != display->Mode || image->width > display->Width-x ||
+                  image->height > display->Height-y)) ok = false;
+    if (ok) {
+        // Framebuffer-only: safe inside audio ownership critical section.
+        // The normal display task performs the subsequent SPI update.
+        GDS_ClearWindow(display, x, y, -1, -1, GDS_COLOR_BLACK);
+        if (image) GDS_DrawRGB(display, image->pixels,
+            (display->Width+x-image->width)/2, (display->Height+y-image->height)/2,
+            image->width, image->height, image->mode);
+        displayer.artwork.updated = image != NULL;
+        displayer.artwork.tick = xTaskGetTickCount();
+        displayer.artwork.pending_flush = true;
+        xTaskNotifyGive(displayer.task);
+    }
+    xSemaphoreGive(displayer.mutex);
+    return ok;
+}
+
 bool displayer_can_artwork(void) {
 	return displayer.artwork.active;
 }
@@ -417,9 +532,9 @@ void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
 		displayer.duration.visible = true;
 		displayer.duration.value = duration / 1000;
 
-		if (displayer.duration.value > 3600) sprintf(displayer.duration.string, "%u:%02u:%02u", (displayer.duration.value / 3600) % 10,
+		if (displayer.duration.value > 3600) sprintf(displayer.duration.string, "%" PRIu32 ":%02" PRIu32 ":%02" PRIu32, (displayer.duration.value / 3600) % 10,
 													(displayer.duration.value % 3600) / 60, displayer.duration.value % 60);
-		else sprintf(displayer.duration.string, "%u:%02u", displayer.duration.value / 60, displayer.duration.value % 60);
+		else sprintf(displayer.duration.string, "%" PRIu32 ":%02" PRIu32, displayer.duration.value / 60, displayer.duration.value % 60);
 
 		char *buf;
 		asprintf(&buf, "%s %s/%s", displayer.header, displayer.duration.string, displayer.duration.string);
@@ -446,6 +561,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 	
 	va_start(args, cmd);
 	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+    if (setup_screen.active) { xSemaphoreGive(displayer.mutex); va_end(args); return; }
 		
 	switch(cmd) {
 	case DISPLAYER_ACTIVATE: {	
@@ -462,19 +578,26 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 		displayer.offset = displayer.boundary = 0;
 		display_bus(&displayer, DISPLAY_BUS_TAKE);
 		if (displayer.artwork.active) GDS_SetTextWidth(display, displayer.artwork.offset);
-		vTaskResume(displayer.task);
+		GDS_Clear(display, GDS_COLOR_BLACK);
+		xTaskNotifyGive(displayer.task);
 		break;
 	}	
 	case DISPLAYER_SUSPEND:		
-		// task will display the line 2 from beginning and suspend
+		// Finish the final line before transferring display ownership to LMS.
+		if (displayer.state == DISPLAYER_ACTIVE) {
+			GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
+			displayer_artwork_locked(NULL);
+		}
 		displayer.state = DISPLAYER_IDLE;
-		displayer_artwork(NULL);
 		display_bus(&displayer, DISPLAY_BUS_GIVE);
 		break;		
 	case DISPLAYER_SHUTDOWN:
-		// let the task self-suspend (we might be doing i2c_write)
-		GDS_SetTextWidth(display, 0);
-		displayer_artwork(NULL);
+		displayer.artwork.pending_flush = false;
+		// The renderer holds this mutex throughout each draw; it is now quiescent.
+		if (displayer.state == DISPLAYER_ACTIVE) {
+			GDS_SetTextWidth(display, 0);
+			displayer_artwork_locked(NULL);
+		}
 		displayer.state = DISPLAYER_DOWN;
 		display_bus(&displayer, DISPLAY_BUS_GIVE);
 		break;

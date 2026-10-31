@@ -9,6 +9,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 // no progressive JPEG handling
@@ -27,6 +28,10 @@ struct GDS_Device;
 
 // Width and Height can be NULL if you already know them (actual scaling is closest ^2)
 void*	 	GDS_DecodeJPEG(uint8_t *Source, int *Width, int *Height, float Scale, int RGB_Mode);	// can be 8, 16 or 24 bits per pixel in return
+// Network input: bounded reads and allocation, rejects incomplete/oversized JPEGs.
+// Caller owns the returned bitmap (free). Output fits MaxWidth/MaxHeight.
+void* GDS_DecodeJPEGBounded(const uint8_t *Source, size_t Length, int *Width,
+                          int *Height, int MaxWidth, int MaxHeight, int RGB_Mode);
 void	 	GDS_GetJPEGSize(uint8_t *Source, int *Width, int *Height);
 bool 		GDS_DrawJPEG( struct GDS_Device* Device, uint8_t *Source, int x, int y, int Fit);	
 void 		GDS_DrawRGB( struct GDS_Device* Device, uint8_t *Image, int x, int y, int Width, int Height, int RGB_Mode );

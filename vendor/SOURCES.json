@@ -1,0 +1,62 @@
+[
+  {
+    "directory": "mad",
+    "url": "https://github.com/philippe44/mad",
+    "commit": "54f589f78b1da780be742faafe6aa0f8405a5abb",
+    "subdirectory": "."
+  },
+  {
+    "directory": "flac",
+    "url": "https://github.com/xiph/flac",
+    "commit": "c87c4f4514c35eff54e4a08665a380fb43a6c8ea",
+    "subdirectory": "."
+  },
+  {
+    "directory": "ogg",
+    "url": "https://github.com/xiph/ogg",
+    "commit": "db5c7a49ce7ebda47b15b78471e78fb7f2483e22",
+    "subdirectory": "."
+  },
+  {
+    "directory": "opus",
+    "url": "https://github.com/xiph/opus",
+    "commit": "bce1f392353d72d77d543bb2069a044ae1045e9d",
+    "subdirectory": "."
+  },
+  {
+    "directory": "soxr",
+    "url": "https://github.com/philippe44/soxr",
+    "commit": "ee03a6bb3384d793ada0b1ea7722febbcaa3597d",
+    "subdirectory": "."
+  },
+  {
+    "directory": "alac",
+    "url": "https://github.com/philippe44/alac",
+    "commit": "30e526563714325ff384968e116060c4ed606f06",
+    "subdirectory": "."
+  },
+  {
+    "directory": "helix-aac",
+    "url": "https://github.com/earlephilhower/ESP8266Audio.git",
+    "commit": "e1f2a1a34aa460f5cca7a60b69d9a350fd099938",
+    "subdirectory": "src/libhelix-aac"
+  },
+  {
+    "directory": "mad-embedded",
+    "url": "https://github.com/earlephilhower/ESP8266Audio.git",
+    "commit": "e1f2a1a34aa460f5cca7a60b69d9a350fd099938",
+    "subdirectory": "src/libmad"
+  },
+  {
+    "directory": "addons",
+    "url": "https://github.com/philippe44/libcodecs",
+    "commit": "0271a24443658518264f1caac368d60accf1072c",
+    "subdirectory": "addons"
+  },
+  {
+    "directory": "tremor",
+    "url": "https://github.com/sezero/tremor",
+    "commit": "18a673fc97d95dffff3ccdeea7d493b2a6ab4481",
+    "subdirectory": "."
+  }
+]

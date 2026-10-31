@@ -15,8 +15,6 @@
 #include <fstream>
 #include <stdarg.h>
 #include <ApResolve.h>
-#include <deque>
-#include <mutex>
 
 #include "BellTask.h"
 #include "MDNSService.h"
@@ -24,6 +22,7 @@
 #include "CSpotContext.h"
 #include "SpircHandler.h"
 #include "LoginBlob.h"
+#include "ZeroconfForm.h"
 #include "CentralAudioBuffer.h"
 #include "Logger.h"
 #include "Utils.h"
@@ -39,7 +38,7 @@
 #if __has_include("client_info.h")
 #include "client_info.h"
 #else
-#warning "missing Spotify's CLIENT_ID and/or CLIENT_SECRET (set SPOTIFY_SECRET env variable or set it in client_info.h)"
+#pragma message("Spotify application credentials not embedded; configure clientId/clientSecret in NVS before authentication")
 #define CLIENT_ID "<your client id>"
 #define CLIENT_SECRET "<your client secret>"
 #endif
@@ -59,6 +58,8 @@ static const struct {
 class cspotPlayer : public bell::Task {
 private:
     std::string name;
+    std::string clientId;
+    std::string clientSecret;
     bell::WrappedSemaphore clientConnected;
     std::atomic<bool> isPaused;
     enum states { ABORT, LINKED, DISCO };
@@ -72,8 +73,7 @@ private:
     int serverPort;
     cspot_cmd_cb_t cmdHandler;
     cspot_data_cb_t dataHandler;
-    std::string streamTrackId, playTrackId;
-    std::mutex trackMutex;
+    std::string lastTrackId;
     cspot::TrackInfo trackInfo;
 
     std::shared_ptr<cspot::LoginBlob> blob;
@@ -106,6 +106,18 @@ cspotPlayer::cspotPlayer(const char* name, httpd_handle_t server, int port, cspo
     if ((item = cJSON_GetObjectItem(config, "bitrate")) != NULL) bitrate = item->valueint;   
     if ((item = cJSON_GetObjectItem(config, "deviceName") ) != NULL) this->name = item->valuestring;
     else this->name = name; 
+
+    // Read client credentials from NVS config, fall back to compile-time defines
+    if ((item = cJSON_GetObjectItem(config, "clientId")) != NULL && item->valuestring != NULL && strlen(item->valuestring) > 0) {
+        this->clientId = item->valuestring;
+    } else {
+        this->clientId = CLIENT_ID;
+    }
+    if ((item = cJSON_GetObjectItem(config, "clientSecret")) != NULL && item->valuestring != NULL && strlen(item->valuestring) > 0) {
+        this->clientSecret = item->valuestring;
+    } else {
+        this->clientSecret = CLIENT_SECRET;
+    }
     
     if ((item = cJSON_GetObjectItem(config, "zeroConf")) != NULL) {
         zeroConf = item->valueint;
@@ -129,23 +141,15 @@ cspotPlayer::cspotPlayer(const char* name, httpd_handle_t server, int port, cspo
 }
 
 size_t cspotPlayer::pcmWrite(uint8_t *pcm, size_t bytes, std::string_view trackId) {
-    /* The audio buffer can be large (the sink buffer) so we might be way in advance compared 
-     * to real time. We then need to manage having just one streaming and one playing and be
-     * careful for notification especially when seeking */
-    if (streamTrackId != trackId) {
-        CSPOT_LOG(info, "new track started <%s> => <%s>", streamTrackId.c_str(), trackId.data());
-        
-        std::unique_lock lock(trackMutex);
-        if (this->playTrackId != trackId && this->playTrackId != this->streamTrackId) return (size_t) 0;
-        this->streamTrackId = trackId;
-        lock.unlock();
-        
+    if (lastTrackId != trackId) {
+        CSPOT_LOG(info, "new track started <%s> => <%s>", lastTrackId.c_str(), trackId.data());
+        lastTrackId = trackId;
         trackHandler();
-    }    
-    
-    return dataHandler(pcm, bytes);        
+    }
+
+    return dataHandler(pcm, bytes);
 }
-     
+
 extern "C" {
     static esp_err_t handleGET(httpd_req_t *request) {
         return player->handleGET(request);
@@ -171,63 +175,49 @@ esp_err_t cspotPlayer::handleGET(httpd_req_t *request) {
 }
 
 esp_err_t cspotPlayer::handlePOST(httpd_req_t *request) {
-    cJSON* response= cJSON_CreateObject(); 
-    //see https://developer.spotify.com/documentation/commercial-hardware/implementation/guides/zeroconf
-
-    if (cmdHandler(CSPOT_BUSY)) {
-        cJSON_AddNumberToObject(response, "status", 101);
-        cJSON_AddStringToObject(response, "statusString", "OK");
-        cJSON_AddNumberToObject(response, "spotifyError", 0);
-
-        // get body if any (add '\0' at the end if used as string)
-        if (request->content_len) {
-            char* body = (char*) calloc(1, request->content_len + 1);
-            int size = httpd_req_recv(request, body, request->content_len);
-
-            // I know this is very crude and unsafe...
-            url_decode(body);
-            char *key = strtok(body, "&");
-
-            std::map<std::string, std::string> queryMap;
-
-            while (key) {
-                char *value = strchr(key, '=');
-                *value++ = '\0';
-                queryMap[key] = value;
-                key = strtok(NULL, "&");
-            };
-
-            free(body);
-
-            // Pass user's credentials to the blob and give the token
-            blob->loadZeroconfQuery(queryMap);
-            clientConnected.give();
-        }
-    } else {
-        cJSON_AddNumberToObject(response, "status", 202);
-        cJSON_AddStringToObject(response, "statusString", "ERROR-LOGIN-FAILED");
-        cJSON_AddNumberToObject(response, "spotifyError", 0);
-        
-        CSPOT_LOG(info, "sink is busy, can't accept request");
+    auto reply = [&](int code, const char *label, const char *httpStatus) {
+        char response[192];
+        int length = snprintf(response, sizeof(response),
+            "{\"status\":%d,\"statusString\":\"%s\",\"spotifyError\":0,\"responseSource\":\"cspot\"}",
+            code, label);
+        httpd_resp_set_status(request, httpStatus);
+        httpd_resp_set_type(request, "application/json");
+        return httpd_resp_send(request, response, length);
+    };
+    bool bodyComplete = false;
+    try {
+        auto body = cspot::readZeroconfBody(request->content_len,
+            [&](char *buffer, size_t length) { return httpd_req_recv(request, buffer, length); });
+        bodyComplete = true;
+        auto query = cspot::parseZeroconfForm(body);
+        if (!blob || !cmdHandler(CSPOT_BUSY))
+            return reply(202, "ERROR-LOGIN-FAILED", "200 OK");
+        blob->loadZeroconfQuery(query);
+        clientConnected.give();
+        // Legacy cspot acknowledges queuing here. This does not prove that
+        // the subsequent asynchronous Spotify server authentication succeeded.
+        return reply(101, "OK", "200 OK");
+    } catch (const cspot::ZeroconfFormError& error) {
+        const char *label = error.status == 301 ? "ERROR-MISSING-ACTION" :
+            error.status == 302 ? "ERROR-INVALID-ACTION" :
+            error.status == 303 ? "ERROR-INVALID-ARGUMENTS" : "ERROR-BAD-REQUEST";
+        auto rc = reply(error.status, label, "400 Bad Request");
+        // Do not reuse a connection with an unread or truncated request body.
+        return bodyComplete ? rc : ESP_FAIL;
+    } catch (const std::bad_alloc&) {
+        reply(103, "ERROR-UNKNOWN", "500 Internal Server Error");
+        return ESP_FAIL;
+    } catch (const std::exception&) {
+        // Crypto failures must not escape the HTTP task or expose credentials.
+        CSPOT_LOG(info, "ZeroConf credentials rejected");
+        return reply(202, "ERROR-LOGIN-FAILED", "200 OK");
     }
-
-    char *responseStr = cJSON_PrintUnformatted(response);
-    cJSON_Delete(response);
-    
-    httpd_resp_set_hdr(request, "Content-type", "application/json");
-    esp_err_t rc = httpd_resp_send(request, responseStr, strlen(responseStr));
-    free(responseStr);
-
-    return rc;
 }
 
 void cspotPlayer::eventHandler(std::unique_ptr<cspot::SpircHandler::Event> event) {
     switch (event->eventType) {
     case cspot::SpircHandler::EventType::PLAYBACK_START: {
-        std::unique_lock lock(trackMutex);
-        playTrackId.clear();
-        streamTrackId.clear();
-        lock.unlock();
+        lastTrackId.clear();
         // we are not playing anymore
         trackStatus = TRACK_INIT;
         // memorize position for when track's beginning will be detected
@@ -339,12 +329,11 @@ void cspotPlayer::command(cspot_event_t event) {
 }
 
 void cspotPlayer::enableZeroConf(void) {
-    httpd_uri_t request = {
-		.uri = "/spotify_info",
-		.method = HTTP_GET,
-		.handler = ::handleGET,
-		.user_ctx = NULL,
-    };
+    httpd_uri_t request{};
+    request.uri = "/spotify_info";
+    request.method = HTTP_GET;
+    request.handler = ::handleGET;
+    request.user_ctx = NULL;
     
     // register GET and POST handler for built-in server
     httpd_register_uri_handler(serverHandle, &request);
@@ -378,8 +367,6 @@ void cspotPlayer::runTask() {
 
     // gone with the wind...
     while (1) {
-        int attempts = 5;
-        
         if (useZeroConf) clientConnected.wait();
         CSPOT_LOG(info, "Spotify client launched for %s", name.c_str());
 
@@ -389,21 +376,10 @@ void cspotPlayer::runTask() {
         else if (bitrate == 96) ctx->config.audioFormat = AudioFormat_OGG_VORBIS_96;
         else ctx->config.audioFormat = AudioFormat_OGG_VORBIS_160;
 
-        while (attempts) {
-            try {
-                ctx->session->connectWithRandomAp();
-                break;
-            } catch (const std::exception& e) {
-                CSPOT_LOG(error, "Connection failed: %s (%d)", e.what(), attempts);
-                if (--attempts) BELL_SLEEP_MS(1000);
-            }
-        }    
-        
-        if (!attempts) continue;
-
+        ctx->session->connectWithRandomAp();
         ctx->config.authData = ctx->session->authenticate(blob);
-        ctx->config.clientId = CLIENT_ID;
-        ctx->config.clientSecret = CLIENT_SECRET;
+        ctx->config.clientId = clientId;
+        ctx->config.clientSecret = clientSecret;
 
         // Auth successful
         if (ctx->config.authData.size() > 0) {
@@ -421,6 +397,13 @@ void cspotPlayer::runTask() {
                 xTimerStart(timer, portMAX_DELAY);
             }
 
+            // PlaybackState snapshots this value for its first Spotify Hello.
+            // Restore it before construction, not only after a track loads:
+            // a failed/pending track must not advertise a muted device while
+            // the local output already uses the saved nonzero volume.
+            volume = std::max(0, std::min(volume, static_cast<int>(UINT16_MAX)));
+            ctx->config.volume = volume;
+            CSPOT_LOG(info, "Initial Spotify volume: %d", volume);
             spirc = std::make_unique<cspot::SpircHandler>(ctx);
             state = LINKED;
 			
@@ -451,18 +434,12 @@ void cspotPlayer::runTask() {
                     // inform Spotify that next track has started (don't need to be super accurate)
                     uint32_t started;
                     cmdHandler(CSPOT_QUERY_STARTED, &started);
-                    if (started) {                      
+                    if (started) {
                         CSPOT_LOG(info, "next track's audio has reached DAC (offset %d)", startOffset);
-                        
-                        std::unique_lock lock(trackMutex);
-                        playTrackId = streamTrackId;                    
-                        if (notify) spirc->notifyAudioReachedPlayback(playTrackId);
-                        else notify = true;         
-                        lock.unlock();                        
-                        
+                        if (notify) spirc->notifyAudioReachedPlayback();
+                        else notify = true;
                         cmdHandler(CSPOT_TRACK_INFO, trackInfo.duration, startOffset, trackInfo.artist.c_str(),
                                     trackInfo.album.c_str(), trackInfo.name.c_str(), trackInfo.imageUrl.c_str());
-                                    
                         spirc->updatePositionMs(startOffset);
                         startOffset = 0;
                         trackStatus = TRACK_STREAM;

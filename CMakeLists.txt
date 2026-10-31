@@ -1,8 +1,17 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Compatibility floor for vendored codec CMake projects")
+set(CMAKE_NINJA_FORCE_RESPONSE_FILE ON CACHE BOOL "Windows response files")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 set(PROJECT_VER $ENV{PROJECT_VER})
 add_definitions(-DMODEL_NAME=SqueezeESP32)
+
+# Add Xtensa-specific compiler flags for better code placement (ESP32 rev3)
+# -mtext-section-literals helps keep code and literals closer together
+if(NOT IDF_TARGET STREQUAL "esp32s31")
+  add_compile_options(-mtext-section-literals)
+  add_link_options(-mtext-section-literals)
+endif()
 
 if(NOT DEFINED DEPTH)
 	set(DEPTH "16")
@@ -54,6 +63,58 @@ set(EXTRA_COMPONENT_DIRS components/platform_console/app_recovery components/pla
 
 project(recovery)
 
+if(IDF_TARGET STREQUAL "esp32s31")
+  include(cmake/airplay2_sodium.cmake)
+endif()
+
+if(IDF_TARGET STREQUAL "esp32s31" AND CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)
+  set(ldac_overlay "${CMAKE_BINARY_DIR}/mncast-ldac")
+  execute_process(COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/prepare_ldac_idf.py"
+    --idf "${IDF_PATH}" --out "${ldac_overlay}" RESULT_VARIABLE ldac_overlay_result)
+  if(NOT ldac_overlay_result EQUAL 0)
+    message(FATAL_ERROR "Cannot prepare reviewed LDAC ESP-IDF overlay")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/prepare_ldac_idf.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ldac_idf_helper.h")
+  # The expanded codec CIE must have the same ABI in every compiled component.
+  idf_build_get_property(ldac_components BUILD_COMPONENTS)
+  foreach(component IN LISTS ldac_components)
+    idf_component_get_property(component_lib ${component} COMPONENT_LIB)
+    get_target_property(component_type ${component_lib} TYPE)
+    if(NOT component_type STREQUAL "INTERFACE_LIBRARY")
+      target_include_directories(${component_lib} BEFORE PRIVATE "${ldac_overlay}/include")
+      # LDAC needs 11 octets including LOSC. bt_target.h permits this override;
+      # all users of AVDT/BTA structs must agree, not just the patched sources.
+      target_compile_definitions(${component_lib} PRIVATE AVDT_CODEC_SIZE=16)
+    endif()
+  endforeach()
+  idf_component_get_property(ldac_bt bt COMPONENT_LIB)
+  get_target_property(ldac_bt_sources ${ldac_bt} SOURCES)
+  foreach(file btc_av.c bta_av_co.c btc_a2dp_sink_ext_coedc.c)
+    list(FILTER ldac_bt_sources EXCLUDE REGEX "(^|/)${file}$")
+    list(APPEND ldac_bt_sources "${ldac_overlay}/${file}")
+  endforeach()
+  set_property(TARGET ${ldac_bt} PROPERTY SOURCES "${ldac_bt_sources}")
+endif()
+
+if(IDF_TARGET STREQUAL "esp32s31")
+  # The prebuilt archive exports private FLAC/Vorbis/AAC implementation names.
+  # Isolate those names from Squeezelite's existing codec ABIs, independent of
+  # CMake's transitive link ordering. Keep public esp_* and weak platform hooks.
+  get_target_property(bt_codec_original esp_acodec IMPORTED_LOCATION)
+  set(bt_codec_isolated "${BUILD_DIR}/bt-codec/libesp_audio_codec.a")
+  add_custom_command(OUTPUT "${bt_codec_isolated}"
+    COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/isolate_audio_codec.py"
+      --nm "${CMAKE_NM}" --objcopy "${CMAKE_OBJCOPY}"
+      --input "${bt_codec_original}" --output "${bt_codec_isolated}"
+    DEPENDS "${bt_codec_original}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/isolate_audio_codec.py"
+    VERBATIM)
+  add_custom_target(bt_codec_isolated DEPENDS "${bt_codec_isolated}")
+  set_property(TARGET esp_acodec PROPERTY IMPORTED_LOCATION "${bt_codec_isolated}")
+  add_dependencies(esp_acodec bt_codec_isolated)
+endif()
+
 # we need own "esp_app_desc" to take precedence
 add_custom_command(
 			TARGET recovery.elf
@@ -73,12 +134,29 @@ set_target_properties(recovery.elf PROPERTIES LINK_LIBRARIES "${BCA};idf::app_re
 # build squeezelite, add app_squeezelite to the link
 add_executable(squeezelite.elf "CMakeLists.txt")
 add_dependencies(squeezelite.elf recovery.elf)
+# This second image is not created by project(), so it must receive the SDK's
+# executable link flags explicitly (notably --gc-sections and -fno-lto).
+# Without them unused radio/bootloader objects create spurious unresolved APIs.
+idf_build_get_property(squeezelite_link_options LINK_OPTIONS)
+target_link_options(squeezelite.elf PRIVATE ${squeezelite_link_options})
+idf_build_get_property(squeezelite_link_depends __LINK_DEPENDS)
+set_property(TARGET squeezelite.elf APPEND PROPERTY LINK_DEPENDS "${squeezelite_link_depends}")
+if(IDF_TARGET STREQUAL "esp32s31")
+  target_link_options(squeezelite.elf PRIVATE "-Wl,--defsym=IDF_TARGET_ESP32S31=0")
+endif()
 set_target_properties(squeezelite.elf PROPERTIES LINK_LIBRARIES "${BCA};idf::app_squeezelite;-Wl,--Map=${BUILD_DIR}/squeezelite.map,--wrap=esp_panic_handler")
+if(IDF_TARGET STREQUAL "esp32s31")
+    idf_component_get_property(squeezelite_esptool esptool_py ESPTOOLPY_CMD)
+    idf_component_get_property(squeezelite_image_args esptool_py ESPTOOL_PY_ELF2IMAGE_ARGS)
+else()
+    set(squeezelite_esptool ${ESPTOOLPY})
+    set(squeezelite_image_args ${ESPTOOLPY_FLASH_OPTIONS} ${ESPTOOLPY_ELF2IMAGE_OPTIONS})
+endif()
 add_custom_command(
 			TARGET squeezelite.elf
 			POST_BUILD 
 			COMMAND ${CMAKE_COMMAND} -E echo "Generating ${BUILD_DIR}/squeezelite.bin"
-			COMMAND ${ESPTOOLPY} elf2image ${ESPTOOLPY_FLASH_OPTIONS} ${ESPTOOLPY_ELF2IMAGE_OPTIONS} -o "squeezelite.bin" "squeezelite.elf"
+			COMMAND ${squeezelite_esptool} elf2image ${squeezelite_image_args} -o "squeezelite.bin" "squeezelite.elf"
 	        VERBATIM
 )
 
@@ -203,7 +281,7 @@ endif()
 # target_compile_definitions(mbedtls PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(mbedx509 PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(__idf_mqtt PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
-# target_compile_definitions(__idf_newlib PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
+# target_compile_definitions(__idf_esp_libc PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(__idf_nghttp PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(__idf_nvs_flash PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(__idf_openssl PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)

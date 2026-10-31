@@ -7,8 +7,8 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include "cmd_config.h"
-#include "accessors.h"
 #include "adac.h"
+#include "accessors.h"
 #include "argtable3/argtable3.h"
 #include "cJSON.h"
 #include "cmd_i2ctools.h"
@@ -127,13 +127,16 @@ static struct {
     //		struct arg_dbl *control_delay;
     struct arg_end *end;
 } bt_source_args;
-static struct {
+#ifdef CONFIG_CSPOT_SINK
+static struct
+{
     struct arg_str *deviceName;
     //	struct arg_int *volume;
     struct arg_int *bitrate;
     struct arg_int *zeroConf;
     struct arg_end *end;
 } cspot_args;
+#endif
 static struct {
     struct arg_int *clock;
     struct arg_int *wordselect;

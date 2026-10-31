@@ -68,8 +68,9 @@ static struct soxr *r;
 
 
 void resample_samples(struct processstate *process) {
-	size_t idone, odone;
+	size_t idone = 0, odone = 0;
 	size_t clip_cnt;
+	process->out_frames = 0;
 	
 	soxr_error_t error =
 		SOXR(r, process, r->resampler, process->inbuf, process->in_frames, &idone, process->outbuf, process->max_out_frames, &odone);
@@ -96,8 +97,9 @@ void resample_samples(struct processstate *process) {
 }
 
 bool resample_drain(struct processstate *process) {
-	size_t odone;
+	size_t odone = 0;
 	size_t clip_cnt;
+	process->out_frames = 0;
 		
 	soxr_error_t error = SOXR(r, process, r->resampler, NULL, 0, NULL, process->outbuf, process->max_out_frames, &odone);
 	if (error) {
@@ -323,8 +325,15 @@ bool resample_init(char *opt) {
 	r->scale = pow(10, -1.0 / 20);
 	// override recipe derived values with user specified values
 	r->q_precision = 0;
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && BYTES_PER_FRAME == 8
+	// Keep the selected soxr recipe's anti-aliasing transition. The legacy
+	// stopband at 1.25 * Nyquist is unsuitable for high-resolution downsampling.
+	r->q_passband_end = 0;
+	r->q_stopband_begin = 0;
+#else
 	r->q_passband_end = 0.75;
 	r->q_stopband_begin = 1.25;
+#endif
 
 	if (recipe && recipe[0] != '\0') {
 		if (strchr(recipe, 'v')) r->q_recipe = SOXR_VHQ;

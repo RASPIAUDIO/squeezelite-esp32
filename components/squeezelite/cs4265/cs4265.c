@@ -13,8 +13,7 @@
 //#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2s.h"
-#include "driver/i2c.h"
+#include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "adac.h"
@@ -36,7 +35,7 @@ static bool volume(unsigned left, unsigned right);
 static void power(adac_power_e mode);
 static esp_err_t cs4265_update_bit(uint8_t reg_no,uint8_t mask,uint8_t val );
 static esp_err_t set_clock();
-const struct adac_s dac_cs4265 = { "CS4265", init, adac_deinit, power, speaker, headset, volume };
+const struct adac_s dac_cs4265 = { "CS4265", init, adac_deinit, power, speaker, headset, volume, NULL };
 
 struct cs4265_cmd_s {
 	uint8_t reg;
@@ -407,7 +406,7 @@ static bool init(char *config, int i2c_port, i2s_config_t *i2s_config) {
 	}
 
 	i2c_master_stop(i2c_cmd);	
-	esp_err_t res = i2c_master_cmd_begin(i2c_port, i2c_cmd, 500 / portTICK_RATE_MS);
+	esp_err_t res = i2c_master_cmd_begin(i2c_port, i2c_cmd, 500 / portTICK_PERIOD_MS);
     i2c_cmd_link_delete(i2c_cmd);
 
 	if (res != ESP_OK) {

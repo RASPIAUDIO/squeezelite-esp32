@@ -1,0 +1,17 @@
+[
+  {
+    "path": "components/sendspin_lib",
+    "commit": "9a15c83f06718fdb10130e56383c6379313e6d69",
+    "local_patch_included": true
+  },
+  {
+    "path": "components/telnet/libtelnet",
+    "commit": "4218ce9c01f6edb7d219b7a3590d9b3f75e12a74",
+    "local_patch_included": false
+  },
+  {
+    "path": "components/wifi-manager/UML-State-Machine-in-C",
+    "commit": "96264241ad7a247ee143acbf81005ba82802d1fa",
+    "local_patch_included": false
+  }
+]

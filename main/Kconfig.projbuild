@@ -60,6 +60,15 @@ menu "Squeezelite-ESP32"
 				select LED_LOCKED
 				select SPKFAULT_LOCKED
 				select TARGET_LOCKED
+			config MNCAST_S31_COREBOARD
+				bool "MnCast ESP32-S31 Function CoreBoard-1"
+				depends on IDF_TARGET_ESP32S31
+				select JACK_LOCKED
+				select BAT_LOCKED
+				select LED_LOCKED
+				select SPKFAULT_LOCKED
+				select AMP_LOCKED
+				select TARGET_LOCKED
 			config MUSE
 				bool "Muse"
 				select JACK_LOCKED
@@ -88,12 +97,14 @@ menu "Squeezelite-ESP32"
 		# project name if they are visible config - they have to be silent strings
 		config PROJECT_NAME
 			string
+			default "MnCast-S31" if MNCAST_S31_COREBOARD
 			default "SqueezeAMP" if SQUEEZEAMP
 			default "Squeezelite-TWATCH" if TWATCH2020
 			default "Muse" if MUSE
 			default "Squeezelite-ESP32"
 		config FW_PLATFORM_NAME
 			string
+			default "ESP32S31" if MNCAST_S31_COREBOARD
 			default "SqueezeAmp" if SQUEEZEAMP
 			default "TWATCH" if TWATCH2020
 			default "Muse" if MUSE
@@ -102,6 +113,7 @@ menu "Squeezelite-ESP32"
 		# these parameters are "aggregates"	that take precedence. They must have a default value
 		config DAC_CONFIG
 			string
+			default "model=ES8311,bck=53,ws=55,do=56,mck=52,sda=51,scl=50,i2c=24" if MNCAST_S31_COREBOARD
 			default "model=TAS57xx,bck=33,ws=25,do=32,sda=27,scl=26,mute=14:0" if SQUEEZEAMP
 			default "model=I2S,bck=26,ws=25,do=33,i2c=53,sda=21,scl=22" if TWATCH2020
 			default "model=I2S,bck=5,ws=25,do=26,di=35,i2c=16,sda=18,scl=23,mck" if MUSE
@@ -124,6 +136,7 @@ menu "Squeezelite-ESP32"
 			default ""
 		config ETH_CONFIG
 			string
+			default "model=YT8531,mdc=5,mdio=6,rst=7" if MNCAST_S31_COREBOARD
 			default ""
 		# AGGREGATES - end		
 		config DAC_CONTROLSET
@@ -146,6 +159,7 @@ menu "Squeezelite-ESP32"
 			default ""			
 		config AMP_GPIO		
 			int
+			default 57 if MNCAST_S31_COREBOARD
 			default 21 if MUSE
 			default -1
 		config POWER_GPIO		
@@ -384,7 +398,7 @@ menu "Squeezelite-ESP32"
 	endmenu
 	
 	menu "LED configuration"
-		visible if !SQUEEZEAMP && !TWATCH2020 && !MUSE
+		visible if !SQUEEZEAMP && !TWATCH2020 && !MUSE && !MNCAST_S31_COREBOARD
 		config LED_GREEN_GPIO
 			int "Green led GPIO"
 			help

@@ -37,10 +37,10 @@
 #include "tools.h"
 static const char TAG[] = "http_server";
 
-EXT_RAM_ATTR static httpd_handle_t _server;
-EXT_RAM_ATTR static int _port;
-EXT_RAM_ATTR rest_server_context_t *rest_context;
-EXT_RAM_ATTR RingbufHandle_t messaging;
+EXT_RAM_BSS_ATTR static httpd_handle_t _server;
+EXT_RAM_BSS_ATTR static int _port;
+EXT_RAM_BSS_ATTR rest_server_context_t *rest_context;
+EXT_RAM_BSS_ATTR RingbufHandle_t messaging;
 
 httpd_handle_t http_get_server(int *port) {
 	if (port) *port = _port;
@@ -69,6 +69,12 @@ void register_regular_handlers(httpd_handle_t server){
 	httpd_register_uri_handler(server, &config_get);
 	httpd_uri_t status_get = { .uri = "/status.json", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = rest_context };
 	httpd_register_uri_handler(server, &status_get);
+    httpd_uri_t ss_page = { .uri="/sendspin", .method=HTTP_GET, .handler=sendspin_page_handler, .user_ctx=rest_context };
+    httpd_uri_t ss_get = { .uri="/sendspin.json", .method=HTTP_GET, .handler=sendspin_api_handler, .user_ctx=rest_context };
+    httpd_uri_t ss_post = { .uri="/sendspin.json", .method=HTTP_POST, .handler=sendspin_api_handler, .user_ctx=rest_context };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server,&ss_page));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server,&ss_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server,&ss_post));
 	httpd_uri_t messages_get = { .uri = "/messages.json", .method = HTTP_GET, .handler = messages_get_handler, .user_ctx = rest_context };
 	httpd_register_uri_handler(server, &messages_get);
 
@@ -125,6 +131,11 @@ void register_regular_handlers(httpd_handle_t server){
 
 
 
+    httpd_uri_t windows_probe = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = redirect_ev_handler, .user_ctx = rest_context };
+    httpd_register_uri_handler(server, &windows_probe);
+    httpd_uri_t windows_ncsi = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = redirect_ev_handler, .user_ctx = rest_context };
+    httpd_register_uri_handler(server, &windows_ncsi);
+
 	ESP_LOGD(TAG,"Registering default error handler for 404");
 	httpd_register_err_handler(server, HTTPD_404_NOT_FOUND,&err_handler);
 
@@ -147,7 +158,7 @@ esp_err_t http_server_start()
     strlcpy(rest_context->base_path, "/res/", sizeof(rest_context->base_path));
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 30;
+    config.max_uri_handlers = 36;
     config.max_open_sockets = 3;
 	config.lru_purge_enable = true;
 	config.backlog_conn = 1;

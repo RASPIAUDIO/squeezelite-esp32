@@ -7,9 +7,10 @@
 */
 
 #include <stdio.h>
+#include <inttypes.h>
 #include "esp_log.h"
+#include "esp_chip_info.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
 #include "driver/spi_master.h"
 #include "platform_config.h"
 #include "accessors.h"
@@ -18,7 +19,7 @@
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "stdbool.h"
-#include "driver/adc.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_attr.h"
 #include "soc/spi_periph.h"
 #include "esp_err.h"
@@ -26,7 +27,6 @@
 #include "sdkconfig.h"
 #include "soc/efuse_periph.h"
 #include "driver/gpio.h"
-#include "driver/spi_common_internal.h"
 #if CONFIG_IDF_TARGET_ESP32   
 #include "esp32/rom/efuse.h"
 #endif
@@ -77,6 +77,9 @@ static char * get_dac_config_string(){
  * 
  */
 bool is_dac_config_locked(){
+#if CONFIG_MNCAST_S31_COREBOARD
+    return false; /* Saved DAC profile may select a stereo DAC on J2. */
+#endif
 #if ( defined CONFIG_DAC_CONFIG )
 	if(strlen(CONFIG_DAC_CONFIG) > 0){
 		return true;
@@ -121,7 +124,7 @@ static void set_i2s_pin(char *config, i2s_pin_config_t *pin_config) {
  * Get i2s config structure from config string
  */
 const i2s_platform_config_t * config_i2s_get_from_str(char * dac_config ){
-	static EXT_RAM_ATTR i2s_platform_config_t i2s_dac_pin;
+	static EXT_RAM_BSS_ATTR i2s_platform_config_t i2s_dac_pin;
 	memset(&i2s_dac_pin, 0xff, sizeof(i2s_dac_pin));
 	set_i2s_pin(dac_config, &i2s_dac_pin.pin);
 	strcpy(i2s_dac_pin.model, "i2s");
@@ -144,7 +147,7 @@ const i2s_platform_config_t * config_i2s_get_from_str(char * dac_config ){
  * Get eth config structure from config string
  */
 const eth_config_t * config_eth_get_from_str(char* config ){
-	static EXT_RAM_ATTR eth_config_t eth_config; 
+	static EXT_RAM_BSS_ATTR eth_config_t eth_config; 
 	eth_config.rst = eth_config.intr = -1;
 
 	PARSE_PARAM_STR(config, "model", '=', eth_config.model, 15);
@@ -167,7 +170,7 @@ const eth_config_t * config_eth_get_from_str(char* config ){
 	eth_config.host = spi_system_host;
 	eth_config.valid = true;
 
-	if(!eth_config.model || strlen(eth_config.model)==0){
+	if(strlen(eth_config.model)==0){
 		eth_config.valid = false;
 		return &eth_config;
 	}
@@ -204,7 +207,7 @@ const eth_config_t * config_eth_get_from_str(char* config ){
  */
 const i2s_platform_config_t * config_spdif_get( ){
 	char * spdif_config = config_spdif_get_string();
-	static EXT_RAM_ATTR i2s_platform_config_t i2s_dac_config;
+	static EXT_RAM_BSS_ATTR i2s_platform_config_t i2s_dac_config;
 	memcpy(&i2s_dac_config, config_i2s_get_from_str(spdif_config), sizeof(i2s_dac_config));
 	free(spdif_config);
 	return &i2s_dac_config;
@@ -215,7 +218,7 @@ const i2s_platform_config_t * config_spdif_get( ){
  */
 const i2s_platform_config_t * config_dac_get(){
 	char * spdif_config = get_dac_config_string();
-	static EXT_RAM_ATTR i2s_platform_config_t i2s_dac_config;
+	static EXT_RAM_BSS_ATTR i2s_platform_config_t i2s_dac_config;
 	memcpy(&i2s_dac_config, config_i2s_get_from_str(spdif_config), sizeof(i2s_dac_config));
 	free(spdif_config);
 	return &i2s_dac_config;
@@ -248,7 +251,7 @@ const eth_config_t * config_eth_get( ){
 	if(config && strlen(config)>0){
 		ESP_LOGD(TAG,"Parsing ethernet configuration %s", config);
 	}
-	static EXT_RAM_ATTR eth_config_t eth_config;
+	static EXT_RAM_BSS_ATTR eth_config_t eth_config;
 	memcpy(&eth_config, config_eth_get_from_str(config), sizeof(eth_config));
 	FREE_AND_NULL(config);
 	return &eth_config;
@@ -269,7 +272,7 @@ esp_err_t config_i2c_set(const i2c_config_t * config, int port){
 	esp_err_t err=ESP_OK;
 	char * config_buffer=malloc_init_external(buffer_size);
 	if(config_buffer)  {
-		snprintf(config_buffer,buffer_size,"scl=%u,sda=%u,speed=%u,port=%u",config->scl_io_num,config->sda_io_num,config->master.clk_speed,port);
+		snprintf(config_buffer,buffer_size,"scl=%u,sda=%u,speed=%d,port=%u",config->scl_io_num,config->sda_io_num,config->master.clk_speed,port);
 		log_send_messaging(MESSAGING_INFO,"Updating I2C configuration to %s",config_buffer);
 		err = config_set_value(NVS_TYPE_STR, "i2c_config", config_buffer);
 		if(err!=ESP_OK){
@@ -536,12 +539,12 @@ const display_config_t * config_display_get(){
 const i2c_config_t * config_i2c_get(int * i2c_port) {
 	char *nvs_item;
 	static i2c_config_t i2c = {
-		.mode = I2C_MODE_MASTER,
+		.mode = 0,  // Master mode
 		.sda_io_num = -1,
-		.sda_pullup_en = GPIO_PULLUP_ENABLE,
+		.sda_pullup_en = 1,  // GPIO_PULLUP_ENABLE
 		.scl_io_num = -1,
-		.scl_pullup_en = GPIO_PULLUP_ENABLE,
-		.master.clk_speed = 0,
+		.scl_pullup_en = 1,  // GPIO_PULLUP_ENABLE
+		.master = { .clk_speed = 0 },
 	};
 
 	i2c.master.clk_speed = i2c_system_speed;
@@ -668,12 +671,16 @@ const set_GPIO_struct_t * get_gpio_struct(){
 #ifdef CONFIG_JACK_LOCKED 
 		gpio_struct.jack.gpio=CONFIG_JACK_GPIO;
 		gpio_struct.jack.fixed=true;
+#ifdef CONFIG_JACK_GPIO_LEVEL
 		gpio_struct.jack.level=CONFIG_JACK_GPIO_LEVEL;
+#endif
 #endif
 #ifdef CONFIG_SPKFAULT_LOCKED
 		gpio_struct.spkfault.gpio=CONFIG_SPKFAULT_GPIO;
 		gpio_struct.spkfault.fixed=true;
+#ifdef CONFIG_SPKFAULT_GPIO_LEVEL
 		gpio_struct.spkfault.level=CONFIG_SPKFAULT_GPIO_LEVEL;
+#endif
 #endif
 	return &gpio_struct;	
 }
@@ -916,8 +923,7 @@ cJSON * get_eth_GPIO(cJSON * list){
 	if(!llist){
 		llist = cJSON_CreateArray();
 	}	
-	spi_host_device_t spi_host;
-	const eth_config_t * eth_config = config_eth_get(&spi_host);
+	const eth_config_t * eth_config = config_eth_get();
 	#if defined(CONFIG_ETH_CONFIG)
 		bool fixed = strlen(CONFIG_ETH_CONFIG)>0;
 	#else
@@ -1101,27 +1107,48 @@ cJSON * get_psram_gpio_list(cJSON * list){
 	const char * spiwp_sd3_io = "spiwp_sd3_io";
 	const char * spihd_sd2_io = "spihd_sd2_io";
 	
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
     uint32_t chip_ver = REG_GET_FIELD(EFUSE_BLK0_RDATA3_REG, EFUSE_RD_CHIP_VER_PKG);
     uint32_t pkg_ver = chip_ver & 0x7;
     if (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32D2WDQ5) {
+#else
+    // ESP-IDF 5.x: Use chip info API instead of direct EFUSE access
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    // For IDF 5.x, assume PSRAM is 1.8V compatible if present
+    if (chip_info.features & CHIP_FEATURE_EMB_PSRAM) {
+#endif
         rtc_vddsdio_config_t cfg = rtc_vddsdio_get_config();
         if (cfg.tieh != RTC_VDDSDIO_TIEH_1_8V) {
             return llist;
         }
         cJSON_AddItemToArray(list,get_gpio_entry(clk,psram_dev,CONFIG_D2WD_PSRAM_CLK_IO,true));
         cJSON_AddItemToArray(list,get_gpio_entry(cs,psram_dev,CONFIG_D2WD_PSRAM_CS_IO,true));
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
     } else if ((pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32PICOD2) || (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32PICOD4)) {
+#else
+    } else {
+#endif
         rtc_vddsdio_config_t cfg = rtc_vddsdio_get_config();
         if (cfg.tieh != RTC_VDDSDIO_TIEH_3_3V) {
             return llist;
         }
 		cJSON_AddItemToArray(list,get_gpio_entry(clk,psram_dev,PICO_PSRAM_CLK_IO,true));
         cJSON_AddItemToArray(list,get_gpio_entry(cs,psram_dev,CONFIG_PICO_PSRAM_CS_IO,true));
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
     } else if ((pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32D0WDQ6) || (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32D0WDQ5)){
+#else
+    }
+    if (true) {  // Fallback for other variants
+#endif
 		cJSON_AddItemToArray(list,get_gpio_entry(clk,psram_dev,CONFIG_D0WD_PSRAM_CLK_IO,true));
         cJSON_AddItemToArray(list,get_gpio_entry(cs,psram_dev,CONFIG_D0WD_PSRAM_CS_IO,true));
     } else {
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
         ESP_LOGW(TAG, "Cant' determine GPIOs for PSRAM chip id: %d", pkg_ver);
+#else
+        ESP_LOGW(TAG, "Can't determine GPIOs for PSRAM chip");
+#endif
 		cJSON_AddItemToArray(list,get_gpio_entry(clk,psram_dev,-1,true));
         cJSON_AddItemToArray(list,get_gpio_entry(cs,psram_dev,-1,true));
     }
@@ -1149,9 +1176,15 @@ cJSON * get_psram_gpio_list(cJSON * list){
 		cJSON_AddItemToArray(list,get_gpio_entry(spiwp_sd3_io,psram_dev,CONFIG_SPIRAM_SPIWP_SD3_PIN,true));
         #endif
 	}
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
     if (spiconfig == EFUSE_SPICONFIG_SPI_DEFAULTS) {
 		cJSON_AddItemToArray(list,get_gpio_entry(clk,flash_dev,SPI_IOMUX_PIN_NUM_CLK,true));
 		cJSON_AddItemToArray(list,get_gpio_entry(cs,flash_dev,SPI_IOMUX_PIN_NUM_CS,true));
+#else
+    if (spiconfig == EFUSE_SPICONFIG_SPI_DEFAULTS) {
+		cJSON_AddItemToArray(list,get_gpio_entry(clk,flash_dev,MSPI_IOMUX_PIN_NUM_CLK,true));
+		cJSON_AddItemToArray(list,get_gpio_entry(cs,flash_dev,MSPI_IOMUX_PIN_NUM_CS0,true));
+#endif
     } else if (spiconfig == EFUSE_SPICONFIG_HSPI_DEFAULTS) {
 		cJSON_AddItemToArray(list,get_gpio_entry(clk,flash_dev,FLASH_HSPI_CLK_IO,true));
 		cJSON_AddItemToArray(list,get_gpio_entry(cs,flash_dev,FLASH_HSPI_CS_IO,true));
@@ -1169,7 +1202,7 @@ cJSON * get_psram_gpio_list(cJSON * list){
  *
  */
 cJSON * get_gpio_list(bool refresh) {
-	gpio_num_t gpio_num;
+
 	if(gpio_list && !refresh){
 		return gpio_list;
 	}
@@ -1184,8 +1217,10 @@ cJSON * get_gpio_list(bool refresh) {
 		int channel = -1;
 		PARSE_PARAM(bat_config, "channel", '=', channel);
 		if(channel != -1){
-			if(adc1_pad_get_io_num(channel,&gpio_num )==ESP_OK){
-				cJSON_AddItemToArray(gpio_list,get_gpio_entry("bat","other",gpio_num,false));
+			adc_unit_t unit_id;
+			adc_channel_t adc_channel;
+			if(adc_oneshot_io_to_channel(channel, &unit_id, &adc_channel) == ESP_OK && unit_id == ADC_UNIT_1){
+				cJSON_AddItemToArray(gpio_list,get_gpio_entry("bat","other",channel,false));
 			}
 		}
 		free(bat_config);

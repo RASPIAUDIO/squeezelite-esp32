@@ -12,7 +12,11 @@
 #include "freertos/timers.h"
 #include "platform_config.h"
 #include "raop.h"
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "airplay2_sink.h"
+#endif
 #include "audio_controls.h"
+#include "audio_source.h"
 #include "display.h"
 #include "accessors.h"
 #include "log_util.h"
@@ -22,7 +26,7 @@
 #define CONFIG_AIRPLAY_NAME		"ESP32-AirPlay"
 #endif
 
-static EXT_RAM_ATTR struct raop_cb_s {
+static EXT_RAM_BSS_ATTR struct raop_cb_s {
 	raop_cmd_vcb_t cmd;
 	raop_data_cb_t data;
 } raop_cbs;
@@ -34,51 +38,58 @@ static log_level *loglevel = &raop_loglevel;
 static struct raop_ctx_s *raop;
 static raop_cmd_vcb_t cmd_handler_chain;
 
+static bool sink_remote_cmd(raop_event_t event, void *arg) {
+#if CONFIG_IDF_TARGET_ESP32S31
+    if (mn_airplay2_active()) { mn_airplay2_control(event); return true; }
+#endif
+    return raop_cmd(raop, event, arg);
+}
+
 static void raop_volume_up(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_VOLUME_UP, NULL);
+	sink_remote_cmd( RAOP_VOLUME_UP, NULL);
 	LOG_INFO("AirPlay volume up");
 }
 
 static void raop_volume_down(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_VOLUME_DOWN, NULL);
+	sink_remote_cmd( RAOP_VOLUME_DOWN, NULL);
 	LOG_INFO("AirPlay volume down");
 }
 
 static void raop_toggle(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_TOGGLE, NULL);
+	sink_remote_cmd( RAOP_TOGGLE, NULL);
 	LOG_INFO("AirPlay play/pause");
 }
 
 static void raop_pause(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_PAUSE, NULL);
+	sink_remote_cmd( RAOP_PAUSE, NULL);
 	LOG_INFO("AirPlay pause");
 }
 
 static void raop_play(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_PLAY, NULL);
+	sink_remote_cmd( RAOP_PLAY, NULL);
 	LOG_INFO("AirPlay play");
 }
 
 static void raop_stop(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_STOP, NULL);
+	sink_remote_cmd( RAOP_STOP, NULL);
 	LOG_INFO("AirPlay stop");
 }
 
 static void raop_prev(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_PREV, NULL);
+	sink_remote_cmd( RAOP_PREV, NULL);
 	LOG_INFO("AirPlay previous");
 }
 
 static void raop_next(bool pressed) {
 	if (!pressed) return;
-	raop_cmd(raop, RAOP_NEXT, NULL);
+	sink_remote_cmd( RAOP_NEXT, NULL);
 	LOG_INFO("AirPlay next");
 }
 
@@ -94,6 +105,10 @@ const static actrls_t controls = {
 	raop_volume_down, raop_volume_up, raop_toggle// knob left, knob_right, knob push
 };
 
+void raop_sink_activate_controls(void) {
+    actrls_set(controls, false, NULL, actrls_ir_action);
+}
+
 /****************************************************************************************
  * Command handler
  */
@@ -101,16 +116,33 @@ static bool cmd_handler(raop_event_t event, ...) {
 	va_list args;	
 	
 	va_start(args, event);
+	audio_source_lock();
+
+#if CONFIG_MNCAST_SENDSPIN
+    /* A revoked session still needs transport cleanup, but must not touch
+     * the active source's controls or display. */
+    if (event == RAOP_STALLED) raop_abort(raop);
+#endif
 	
 	// handle audio event and stop if forbidden
 	if (!cmd_handler_chain(event, args)) {
+		audio_source_unlock();
 		va_end(args);
+#if CONFIG_MNCAST_SENDSPIN
+        /* Transport teardown is successful even when this session never
+         * acquired output (or has already lost it). Skip display/controls. */
+        if (event == RAOP_STOP || event == RAOP_STALLED) return true;
+#endif
 		return false;
 	}
 
 	// now handle events for display
 	switch(event) {
+#if CONFIG_MNCAST_SENDSPIN
+	case RAOP_STREAM:
+#else
 	case RAOP_SETUP:
+#endif
 		actrls_set(controls, false, NULL, actrls_ir_action);
 		displayer_control(DISPLAYER_ACTIVATE, "AIRPLAY", true);
         displayer_artwork(NULL);
@@ -150,6 +182,7 @@ static bool cmd_handler(raop_event_t event, ...) {
 	}
 	
 	va_end(args);
+	audio_source_unlock();
 	
 	return true;
 }
@@ -158,6 +191,9 @@ static bool cmd_handler(raop_event_t event, ...) {
  * Airplay sink de-initialization
  */
 void raop_sink_deinit(void) {
+#if CONFIG_IDF_TARGET_ESP32S31
+    if (mn_airplay2_active()) { mn_airplay2_stop(); return; }
+#endif
 	raop_delete(raop);
 }	
 
@@ -176,6 +212,13 @@ static void raop_sink_start(nm_state_t state_id, int sub_state) {
 	cmd_handler_chain = raop_cbs.cmd;
 
 	LOG_INFO( "starting Airplay for ip %s with servicename %s", inet_ntoa(ipInfo.ip.addr), sink_name);
+#if CONFIG_IDF_TARGET_ESP32S31
+    char *v2 = config_alloc_get_default(NVS_TYPE_STR, "airplay2", "1", 0);
+    bool prefer_v2 = v2 && (!strcmp(v2,"1") || !strcasecmp(v2,"y"));
+    free(v2);
+    if (prefer_v2 && mn_airplay2_start(sink_name)) { free(sink_name); return; }
+    if (prefer_v2) LOG_WARN("AirPlay 2 unavailable; starting legacy AirPlay 1 receiver");
+#endif
 	raop = raop_create(ipInfo.ip.addr, sink_name, mac, 0, cmd_handler, raop_cbs.data);
 	free(sink_name);
 }
@@ -187,6 +230,10 @@ void raop_sink_init(raop_cmd_vcb_t cmd_cb, raop_data_cb_t data_cb) {
 	raop_cbs.cmd = cmd_cb;
 	raop_cbs.data = data_cb;
 
+#ifndef WIN32
+	raop_crypto_init();
+#endif
+
 	network_register_state_callback(NETWORK_WIFI_ACTIVE_STATE, WIFI_CONNECTED_STATE, "raop_sink_start", raop_sink_start);
 	network_register_state_callback(NETWORK_ETH_ACTIVE_STATE, ETH_ACTIVE_CONNECTED_STATE, "raop_sink_start", raop_sink_start);
 }
@@ -197,6 +244,6 @@ void raop_sink_init(raop_cmd_vcb_t cmd_cb, raop_data_cb_t data_cb) {
 void raop_disconnect(void) {
 	LOG_INFO("forced disconnection");
 	// in case we can't communicate with AirPlay controller, abort session 
-	if (!raop_cmd(raop, RAOP_STOP, NULL)) cmd_handler(RAOP_STALLED);
+	if (!sink_remote_cmd( RAOP_STOP, NULL)) cmd_handler(RAOP_STALLED);
     else displayer_control(DISPLAYER_SHUTDOWN);
 }

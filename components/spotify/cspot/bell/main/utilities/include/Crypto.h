@@ -4,14 +4,21 @@
 #include <string>  // for string
 #include <vector>  // for vector
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+#if CONFIG_IDF_TARGET_ESP32S31
+#include <psa/crypto.h>
+#else
 #include <mbedtls/aes.h>  // for mbedtls_aes_context
+#endif
 #include <mbedtls/md.h>   // for mbedtls_md_context_t
 #include <stddef.h>       // for size_t
 #include <stdint.h>       // for uint8_t
 
 #define DH_KEY_SIZE 96
 
-const static unsigned char DHPrime[] = {
+[[maybe_unused]] const static unsigned char DHPrime[] = {
     /* Well-known Group 1, 768-bit prime */
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2,
     0x21, 0x68, 0xc2, 0x34, 0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1,
@@ -24,8 +31,10 @@ const static unsigned char DHPrime[] = {
 class CryptoMbedTLS {
  private:
   mbedtls_md_context_t sha1Context;
+#if !CONFIG_IDF_TARGET_ESP32S31
   mbedtls_aes_context aesCtx;
   bool aesCtxInitialized = false;
+#endif
 
  public:
   CryptoMbedTLS();
