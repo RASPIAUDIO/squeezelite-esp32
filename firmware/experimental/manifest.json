@@ -1,0 +1,53 @@
+{
+  "name": "Squeezelite ESP32-S31",
+  "version": "s31-v0.1.0-exp",
+  "status": "experimental",
+  "source_commit": "8e83e08a15dd0598cf1b3a4439dd41b6f2bfb47c",
+  "sdk_commit": "fff9895c82d744c7237be8847347bdd1b07c6643",
+  "sdk_patch_sha256": "0bf93c1289c94d7c348715079285ac6a1a70614281041336eefbef5c7f9b330f",
+  "sdkconfig_sha256": "69b8aca54bec23d9c637a089b64079d203b5afc3fc81d265c5acebc4f3ab8e0c",
+  "dependency_lock_sha256": "2fee3ba8d9fd9308442b4a8042c303fa7615741b0477de055bbd5449d48c2d90",
+  "audio_depth": 32,
+  "board": "ESP32-S31 Function-CoreBoard-1, 16MB flash / 16MB PSRAM",
+  "default_audio": "onboard ES8311",
+  "factory_flash_offset": "0x0",
+  "application_flash_offset": "0x410000",
+  "flash_files": {
+    "0x2000": "bootloader.bin",
+    "0x8000": "partition-table.bin",
+    "0xd000": "boot_app0.bin",
+    "0x10000": "recovery.bin",
+    "0x410000": "squeezelite.bin"
+  },
+  "personal_settings_included": false,
+  "artifacts": {
+    "boot_app0.bin": {
+      "bytes": 8192,
+      "sha256": "4187e23640ddb4d9e00a91376d2df4aec3b0316e51b2f8f784bd43df49ce8ba9"
+    },
+    "bootloader.bin": {
+      "bytes": 21696,
+      "sha256": "28bdd1bab3b01139b999816c343f6dc1d7cfd03c7de7c38816252552b71affd1"
+    },
+    "factory.bin": {
+      "bytes": 8388336,
+      "sha256": "f1c5344d370550f51e8c55cdb6f9a0c77d131ca6d516bfabbb0feb9fc29ff8b1"
+    },
+    "partition-table.bin": {
+      "bytes": 3072,
+      "sha256": "8303db18a0a3a117865439792a987202c4690e3f7db5795aa8f07534fe0007fd"
+    },
+    "recovery.bin": {
+      "bytes": 1695392,
+      "sha256": "d2cae71a1ca94556aac57b778a87e3821fecad90ae36c3fddab02f9a57d0f045"
+    },
+    "squeezelite.bin": {
+      "bytes": 4128496,
+      "sha256": "18916cd5cf6cf3b6a66f756dceb8b0cad5e9f14d1e4a926d62ded1f0cc7f61c7"
+    }
+  },
+  "local_review_branch": "codex/s31-port",
+  "local_review_source_commit": "e6bafac3ecb9d9c75e460e8b1e35e18f34ac9974",
+  "source_equivalence_report": "../../docs/build-validation.json",
+  "publication_status": "local only; awaiting owner review"
+}

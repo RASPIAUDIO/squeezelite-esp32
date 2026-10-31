@@ -14,6 +14,8 @@ The S31 changes and binaries in this working tree have not been pushed publicly.
   A public S31 release will be made only after review and approval.
 - Follow [installation instructions](docs/INSTALL.md); **S31/16 MB only**.
 - Compile using the pinned SDK and [fresh-clone build instructions](docs/BUILD.md).
+- Review the successful [fresh-clone build verification](docs/BUILD-VALIDATION.md)
+  and the [local review checklist](docs/REVIEW.md) before publication.
 - Connect Ethernet, or configure Wi-Fi using Improv Serial or the fallback access point.
   The local web interface contains Services, Sendspin, audio, display and NVS settings.
   AirPlay 2 is enabled by default; disabling it selects the legacy AirPlay 1 receiver

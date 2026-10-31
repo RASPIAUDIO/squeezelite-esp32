@@ -1,0 +1,46 @@
+esptool v5.6.0
+Image size: 4128496 bytes
+
+ESP32-S31 Image Header
+======================
+Image version: 1
+Entry point: 0x2f000874
+Segments: 5
+Flash size: 16MB
+Flash freq: 80m
+Flash mode: DIO
+
+ESP32-S31 Extended Image Header
+===============================
+WP pin: 0xee (disabled)
+Flash pins drive settings: clk_drv: 0x0, q_drv: 0x0, d_drv: 0x0, cs0_drv: 0x0, hd_drv: 0x0, wp_drv: 0x0
+Chip ID: 32 (ESP32-S31)
+Minimal chip revision: v0.0, (legacy min_rev = 0)
+Maximal chip revision: v0.99
+
+Segments Information
+====================
+Segment   Length   Load addr   File offs  Memory types
+-------  -------  ----------  ----------  ------------
+      0  0x10c3b8  0x402d0020  0x00000018  DROM, IROM
+      1  0x00024  0x2e000010  0x0010c3d8  RTC_IRAM, RTC_DRAM
+      2  0x03c0c  0x2f000000  0x0010c404  DRAM, BYTE_ACCESSIBLE, IRAM
+      3  0x2c07f0  0x40000020  0x00110018  DROM, IROM
+      4  0x1f6b0  0x2f003c0c  0x003d0810  DRAM, BYTE_ACCESSIBLE, IRAM
+
+ESP32-S31 Image Footer
+======================
+Checksum: 0xc6 (valid)
+Validation hash: 629a4b4fec010d2c272e71ed26ab9c947970c80f39ccc957420267cf9bcf87da (valid)
+
+Application Information
+=======================
+Project name: MnCast-S31
+App version: s31-v0.1.0-exp
+Compile time: Oct 31 2026 17:23:07
+ELF file SHA256: 65567bb8342adcbea731f3fb385f1fa1367241cf1b0aac38042bcd437dbccd3b
+ESP-IDF: v6.1-dirty
+Minimal eFuse block revision: 0.0
+Maximal eFuse block revision: 0.99
+MMU page size: 64 KB
+Secure version: 0

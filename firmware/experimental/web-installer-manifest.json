@@ -1,0 +1,17 @@
+{
+  "name": "S31 - Squeezelite (experimental)",
+  "version": "s31-v0.1.0-exp",
+  "improv_wait_time": 30,
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S31",
+      "parts": [
+        {
+          "path": "factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
