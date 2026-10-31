@@ -1,16 +1,34 @@
-# Squeezelite-ESP32 for ESP32-S31 (experimental)
+# Squeezelite-ESP32 for ESP32-S31
 
-An ESP32-S31 port of [Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32),
-developed for the next RASPIAUDIO MnCast. Includes Ethernet/Wi-Fi, a 32-bit audio
-pipeline, Bluetooth Classic, AirPlay, Sendspin, and a local configuration web UI.
-This is the local `codex/s31-port` development branch of the
-[RASPIAUDIO fork](https://github.com/RASPIAUDIOadmin/squeezelite-esp32).
-**Pending review: the public fork currently contains upstream code only.**
-The S31 changes and binaries in this working tree have not been pushed publicly.
+**More power. More audio features.**
+
+High-quality Bluetooth audio, native Gigabit Ethernet, FLAC playback up to
+**24-bit / 192 kHz**, and **AirPlay 2**: this ESP32-S31 port extends
+[Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32) for the next
+RASPIAUDIO MnCast, with a 32-bit audio pipeline and more ways to play your music.
+
+- **High-quality Bluetooth audio:** LDAC and AAC, with SBC fallback; playback
+  confirmed with a Xiaomi phone.
+- **Native Gigabit Ethernet:** the S31 Ethernet MAC connects directly to the
+  onboard YT8531 PHY over RGMII. Wired audio playback is validated; Gigabit describes
+  the hardware interface, not a measured 1 Gbit/s application throughput.
+- **High-resolution FLAC:** 24-bit / 192 kHz playback validated over Ethernet
+  with the external RASPIAUDIO Audio+ V3 DAC.
+- **AirPlay 2 and AirPlay 1:** an AirPlay 2 receiver with artwork support and a
+  selectable legacy AirPlay 1 mode. See the qualification details below.
+- **32-bit audio processing:** 10-band equalizer, loudness and resampling,
+  with high-rate workload limits documented in [status](docs/STATUS.md).
+- **Sendspin:** a Music Assistant client for playback from your Home Assistant
+  audio setup, with connection and pairing controls in the local web interface.
+- **Color display and easy setup:** track information and album artwork on an
+  ILI9341 screen, plus Improv Serial and a QR-assisted captive portal for Wi-Fi.
+
+The board's Gigabit Ethernet capability is documented by
+[Espressif](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html).
 
 ## Install or build
 
-- Use the local files in [`firmware/experimental`](firmware/experimental).
+- Use the local [firmware binaries](firmware/experimental).
   A public S31 release will be made only after review and approval.
 - Follow [installation instructions](docs/INSTALL.md); **S31/16 MB only**.
 - Compile using the pinned SDK and [fresh-clone build instructions](docs/BUILD.md).
@@ -54,16 +72,23 @@ The LCD is used in landscape 320x240; touchscreen support is not qualified.
 
 | Feature | Validation / limit |
 |---|---|
-| Ethernet, Wi-Fi | Playback validated; Wi-Fi 5 GHz / Wi-Fi 6 not qualified |
+| Native Gigabit Ethernet, Wi-Fi | Audio playback validated; Ethernet throughput not benchmarked at 1 Gbit/s; Wi-Fi 5 GHz / Wi-Fi 6 not qualified |
 | FLAC 24-bit / 192 kHz | Validated on external Audio+ V3 with Ethernet; not a claim for the onboard ES8311 |
 | 32-bit DSP | 10-band EQ, loudness and resampling implemented; see [limits](docs/STATUS.md) |
 | Bluetooth Classic | SBC, AAC and LDAC playback confirmed with Xiaomi |
 | AirPlay 1 | Playback and artwork validated |
-| AirPlay 2 | Experimental; software-sender protocol tests, Apple/multiroom qualification pending |
+| AirPlay 2 | Software-sender protocol tests passed; Apple-device/multiroom qualification pending |
 | Sendspin | Paired and tested with Music Assistant; local web settings included |
 | Display | ILI9341 text/artwork validated; touchscreen deferred |
 | Wi-Fi onboarding | Captive portal/QR and Improv Serial tested |
 | Spotify Connect | Discoverable, but audio-key rejection remains unresolved; playback not validated |
+
+## Development and review
+
+This is the local `codex/s31-port` development branch of the
+[RASPIAUDIO fork](https://github.com/RASPIAUDIOadmin/squeezelite-esp32).
+The public fork currently contains upstream code only. The S31 changes and binaries
+remain local pending review and approval for publication.
 
 ## Credits and licenses
 
