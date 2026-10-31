@@ -6,3 +6,5 @@
 *.png binary
 *.jpg binary
 *.pdf binary
+docs/build-evidence/sdkconfig.used -text
+docs/build-evidence/dependencies.used.lock -text
