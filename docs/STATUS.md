@@ -15,7 +15,7 @@ test into a guarantee for every source, output or sample-rate combination.
   reconnect and AP1/AP2 ownership tests. Tests of about five minutes are not an
   overnight stability or Apple-device/multiroom qualification. AirPlay PCM is not
   claimed to carry 24-bit high-resolution content here.
-- Bluetooth SBC/AAC/LDAC were heard clearly from a Xiaomi phone. There is no claim
+- Bluetooth SBC/AAC/LDAC playback was confirmed by listening. There is no claim
   of Bluetooth lossless audio.
 - Sendspin pairing/streaming and web settings are included. The touchscreen is deferred.
 - Improv Serial and the post-flash Wi-Fi flow were confirmed by the user.

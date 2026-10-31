@@ -4,15 +4,14 @@
 
 **Bluetooth audio upgraded: LDAC and AAC, alongside SBC.** This ESP32-S31 port
 adds two Bluetooth receive codecs to the original ESP32-WROVER firmware's SBC
-support, with playback confirmed from a Xiaomi phone.
+support, with playback validated for all three codecs.
 
 It also brings **native Gigabit Ethernet**, **FLAC up to 24-bit / 192 kHz**,
 **AirPlay 2**, **Sendspin**, and **32-bit audio processing** to
 [Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32), developed for
 the next RASPIAUDIO MnCast.
 
-- **High-quality Bluetooth audio:** LDAC and AAC, with SBC fallback; playback
-  confirmed with a Xiaomi phone.
+- **High-quality Bluetooth audio:** LDAC and AAC, with SBC fallback.
 - **Native Gigabit Ethernet:** the S31 Ethernet MAC connects directly to the
   onboard YT8531 PHY over RGMII. Wired audio playback is validated; Gigabit describes
   the hardware interface, not a measured 1 Gbit/s application throughput.
@@ -75,6 +74,22 @@ Sendspin pairing and playback with Music Assistant are tested. Multi-player
 synchronization within each ecosystem is a separate qualification step and is
 not yet claimed as validated for this port. See [validation status](docs/STATUS.md).
 
+## Easier first install
+
+Set up Wi-Fi using either of these two options:
+
+- **On-screen QR code:** with a display connected and configured, scan the QR
+  code shown in fallback access-point mode to join the player's setup Wi-Fi.
+  The captive portal lets you select your home network and enter its password.
+  The setup SSID, password and URL also remain visible as plain text; if the
+  portal does not open automatically, open the displayed URL.
+- **Improv Serial after flashing:** keep the board connected by USB and use
+  **Configure Wi-Fi** in the compatible web installer in Chrome or Edge.
+  Select your network, enter its password, then open the device URL to access
+  the player's local web interface. No display is required.
+
+Prefer a wired connection? Plug in Ethernet and open the player's local web interface.
+
 ## Install or build
 
 - Use the local [firmware binaries](firmware/experimental).
@@ -124,7 +139,7 @@ The LCD is used in landscape 320x240; touchscreen support is not qualified.
 | Native Gigabit Ethernet, Wi-Fi | Audio playback validated; Ethernet throughput not benchmarked at 1 Gbit/s; Wi-Fi 5 GHz / Wi-Fi 6 not qualified |
 | FLAC 24-bit / 192 kHz | Validated on external Audio+ V3 with Ethernet; not a claim for the onboard ES8311 |
 | 32-bit DSP | 10-band EQ, loudness and resampling implemented; see [limits](docs/STATUS.md) |
-| Bluetooth Classic | SBC, AAC and LDAC playback confirmed with Xiaomi |
+| Bluetooth Classic | SBC, AAC and LDAC playback validated |
 | AirPlay 1 | Playback and artwork validated |
 | AirPlay 2 | Software-sender protocol tests passed; Apple-device/multiroom qualification pending |
 | Sendspin | Paired and tested with Music Assistant; local web settings included |
