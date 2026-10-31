@@ -1,33 +1,49 @@
-# Squeezelite-ESP32 for ESP32-S31
+<h1 align="center">Squeezelite-ESP32 for ESP32-S31</h1>
 
-**More power. More audio features.**
+<p align="center"><strong>More power. More audio features.</strong><br>
+Network audio, high-resolution playback and flexible DSP for the next RASPIAUDIO MnCast.</p>
 
-**Bluetooth audio upgraded: LDAC and AAC, alongside SBC.** This ESP32-S31 port
-adds two Bluetooth receive codecs to the original ESP32-WROVER firmware's SBC
-support, with playback validated for all three codecs.
+<p align="center">
+  <a href="#easier-first-install">Easy setup</a> ·
+  <a href="#three-ways-to-multiroom">Multiroom</a> ·
+  <a href="#esp32-wrover-vs-esp32-s31">WROVER vs S31</a> ·
+  <a href="#hardware-and-pinout">Pinout</a> ·
+  <a href="#install-or-build">Install &amp; build</a>
+</p>
 
-It also brings **native Gigabit Ethernet**, **FLAC up to 24-bit / 192 kHz**,
-**AirPlay 2**, **Sendspin**, and **32-bit audio processing** to
-[Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32), developed for
-the next RASPIAUDIO MnCast.
+An ESP32-S31 port of [Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32),
+bringing more ways to listen, connect and shape your sound.
 
-- **High-quality Bluetooth audio:** LDAC and AAC, with SBC fallback.
-- **Native Gigabit Ethernet:** the S31 Ethernet MAC connects directly to the
-  onboard YT8531 PHY over RGMII. Wired audio playback is validated; Gigabit describes
-  the hardware interface, not a measured 1 Gbit/s application throughput.
-- **High-resolution FLAC:** 24-bit / 192 kHz playback validated over Ethernet
-  with the external RASPIAUDIO Audio+ V3 DAC.
-- **AirPlay 2 and AirPlay 1:** an AirPlay 2 receiver with artwork support and a
-  selectable legacy AirPlay 1 mode. See the qualification details below.
-- **32-bit audio processing:** 10-band equalizer, loudness and resampling,
-  with high-rate workload limits documented in [status](docs/STATUS.md).
-- **Sendspin:** a Music Assistant client for playback from your Home Assistant
-  audio setup, with connection and pairing controls in the local web interface.
-- **Color display and easy setup:** track information and album artwork on an
-  ILI9341 screen, plus Improv Serial and a QR-assisted captive portal for Wi-Fi.
+<table>
+<tr>
+<td width="50%" valign="top"><strong>Modern, high-quality Bluetooth audio</strong><br>
+LDAC and AAC reception, with SBC fallback. Playback validated with all three codecs.</td>
+<td width="50%" valign="top"><strong>Native Gigabit Ethernet</strong><br>
+A direct RGMII connection between the S31 MAC and onboard YT8531 PHY for wired network audio.</td>
+</tr>
+<tr>
+<td valign="top"><strong>High-resolution FLAC</strong><br>
+24-bit / 192 kHz playback validated over Ethernet with the external RASPIAUDIO Audio+ V3 DAC.</td>
+<td valign="top"><strong>AirPlay 2</strong><br>
+An AirPlay 2 receiver with artwork support, plus a selectable legacy AirPlay 1 mode.</td>
+</tr>
+<tr>
+<td valign="top"><strong>32-bit audio processing</strong><br>
+10-band equalizer, loudness and resampling on the PCM32 audio path.</td>
+<td valign="top"><strong>Sendspin</strong><br>
+Music Assistant playback for your Home Assistant audio setup, with local connection and pairing controls.</td>
+</tr>
+<tr>
+<td valign="top"><strong>Color display</strong><br>
+Album artwork and track information on an ILI9341 screen.</td>
+<td valign="top"><strong>Easier first install</strong><br>
+On-screen Wi-Fi QR code and captive portal, or Improv Serial setup in the web installer after flashing.</td>
+</tr>
+</table>
 
-The board's Gigabit Ethernet capability is documented by
-[Espressif](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html).
+See [validation status](#status) for tested configurations, AirPlay 2 qualification
+and DSP workload limits. Gigabit is the [documented hardware interface](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html),
+not a measured application throughput.
 
 ## ESP32-WROVER vs ESP32-S31
 
@@ -76,19 +92,16 @@ not yet claimed as validated for this port. See [validation status](docs/STATUS.
 
 ## Easier first install
 
-Set up Wi-Fi using either of these two options:
+**Flash → connect → listen.** Choose the Wi-Fi setup that suits your build.
 
-- **On-screen QR code:** with a display connected and configured, scan the QR
-  code shown in fallback access-point mode to join the player's setup Wi-Fi.
-  The captive portal lets you select your home network and enter its password.
-  The setup SSID, password and URL also remain visible as plain text; if the
-  portal does not open automatically, open the displayed URL.
-- **Improv Serial after flashing:** keep the board connected by USB and use
-  **Configure Wi-Fi** in the compatible web installer in Chrome or Edge.
-  Select your network, enter its password, then open the device URL to access
-  the player's local web interface. No display is required.
+| On-screen QR code | Improv Serial over USB |
+|---|---|
+| **Scan and join** the player's setup Wi-Fi using the QR code displayed in fallback access-point mode. | **Flash and configure** without unplugging the board: choose **Configure Wi-Fi** in the compatible Chrome or Edge web installer. |
+| **Enter your network credentials** in the captive portal. | **Select your network and enter its password**, then open the device URL. |
+| Requires a connected, configured display. The setup SSID, password and URL stay visible in plain text. | No display required. Setup happens in the web installer; the player's local web interface becomes available once connected. |
 
-Prefer a wired connection? Plug in Ethernet and open the player's local web interface.
+If the captive portal does not open automatically, use the URL shown on screen.
+**Prefer Ethernet?** Plug in the cable and open the player's local web interface.
 
 ## Install or build
 
