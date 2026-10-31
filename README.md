@@ -2,10 +2,14 @@
 
 **More power. More audio features.**
 
-High-quality Bluetooth audio, native Gigabit Ethernet, FLAC playback up to
-**24-bit / 192 kHz**, **AirPlay 2**, and **Sendspin**: this ESP32-S31 port extends
-[Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32) for the next
-RASPIAUDIO MnCast, with a 32-bit audio pipeline and more ways to play your music.
+**Bluetooth audio upgraded: LDAC and AAC, alongside SBC.** This ESP32-S31 port
+adds two Bluetooth receive codecs to the original ESP32-WROVER firmware's SBC
+support, with playback confirmed from a Xiaomi phone.
+
+It also brings **native Gigabit Ethernet**, **FLAC up to 24-bit / 192 kHz**,
+**AirPlay 2**, **Sendspin**, and **32-bit audio processing** to
+[Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32), developed for
+the next RASPIAUDIO MnCast.
 
 - **High-quality Bluetooth audio:** LDAC and AAC, with SBC fallback; playback
   confirmed with a Xiaomi phone.
@@ -26,6 +30,36 @@ RASPIAUDIO MnCast, with a 32-bit audio pipeline and more ways to play your music
 The board's Gigabit Ethernet capability is documented by
 [Espressif](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html).
 
+## ESP32-WROVER vs ESP32-S31
+
+This compares the original ESP32-WROVER firmware at upstream `master-v4.3`
+commit `ee1720c7556ffec5f43329aadd47c20546bdbb79` with this S31 port.
+It compares those implementations, not everything that could be implemented on
+either chip. The original firmware offers both 16-bit and 32-bit builds.
+
+| Capability | Original ESP32-WROVER firmware | This ESP32-S31 port |
+|---|---|---|
+| **Bluetooth receive codecs** | **SBC** | **SBC + AAC + LDAC**, all three confirmed by listening |
+| **FLAC sample rate** | Upstream documents up to **96 kHz** in both build modes | **192 kHz / 24-bit** playback validated over Ethernet with Audio+ V3 |
+| **Audio precision** | 16-bit build truncates 24-bit sources; 32-bit build preserves up to 24-bit source depth | **32-bit PCM pipeline** preserving 24-bit source audio |
+| **Equalizer with 24-bit audio** | Published capability table disables EQ in the 32-bit build; 16-bit EQ is limited to 48 kHz | **10-band EQ and loudness on PCM32**, filter tests through 192 kHz; combined-workload limits apply |
+| **Resampling on PCM32** | Not available in the upstream 32-bit build | **libsoxr resampling on PCM32** for LMS playback, including tested conversions to/from 192 kHz |
+| **Native Ethernet interface** | ESP32 MAC: **10/100 Mbit/s**, with an external PHY on boards that provide Ethernet | S31 MAC + onboard YT8531: **Gigabit Ethernet over RGMII** |
+| **AirPlay** | AirPlay 1 | **AirPlay 1 + AirPlay 2**; Apple-device/multiroom qualification pending |
+| **Sendspin** | Not included in this upstream baseline | **Music Assistant client**, pairing/playback tested, local web controls |
+| **Wi-Fi onboarding** | Existing access-point/web setup | Adds **Improv Serial and QR-assisted captive portal** |
+
+The demonstrated FLAC sampling rate is **twice the upstream documented ceiling**
+(192 vs 96 kHz). Ethernet rates describe the hardware interfaces; there is no
+claim of a tenfold measured streaming throughput or a measured CPU speedup.
+The high-resolution result uses the external Audio+ V3, not the onboard ES8311.
+Forced 176.4-to-192 kHz conversion with all DSP effects remains outside the
+validated continuous-playback envelope; see [qualification limits](docs/STATUS.md).
+
+Baseline sources: [upstream capability table](https://github.com/sle118/squeezelite-esp32/blob/ee1720c7556ffec5f43329aadd47c20546bdbb79/README.md),
+[original SBC receiver](https://github.com/sle118/squeezelite-esp32/blob/ee1720c7556ffec5f43329aadd47c20546bdbb79/components/driver_bt/bt_app_sink.c#L330),
+and [Espressif's ESP32 Ethernet specifications](https://documentation.espressif.com/esp32_datasheet_en.html).
+
 ## Three ways to multiroom
 
 Choose the ecosystem that fits your home. The player includes clients for three
@@ -38,7 +72,7 @@ multiroom systems, each managing its own synchronized speaker groups:
 | **AirPlay 2** | Use compatible Apple senders to select multiple AirPlay 2 receivers; Apple-device and multiroom qualification is still pending on this port. |
 
 Sendspin pairing and playback with Music Assistant are tested. Multi-player
-synchronization across these ecosystems is a separate qualification step and is
+synchronization within each ecosystem is a separate qualification step and is
 not yet claimed as validated for this port. See [validation status](docs/STATUS.md).
 
 ## Install or build
