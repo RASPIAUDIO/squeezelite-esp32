@@ -3,7 +3,7 @@
 **More power. More audio features.**
 
 High-quality Bluetooth audio, native Gigabit Ethernet, FLAC playback up to
-**24-bit / 192 kHz**, and **AirPlay 2**: this ESP32-S31 port extends
+**24-bit / 192 kHz**, **AirPlay 2**, and **Sendspin**: this ESP32-S31 port extends
 [Squeezelite-ESP32](https://github.com/sle118/squeezelite-esp32) for the next
 RASPIAUDIO MnCast, with a 32-bit audio pipeline and more ways to play your music.
 
@@ -25,6 +25,21 @@ RASPIAUDIO MnCast, with a 32-bit audio pipeline and more ways to play your music
 
 The board's Gigabit Ethernet capability is documented by
 [Espressif](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html).
+
+## Three ways to multiroom
+
+Choose the ecosystem that fits your home. The player includes clients for three
+multiroom systems, each managing its own synchronized speaker groups:
+
+| Ecosystem | How you use it |
+|---|---|
+| **Lyrion / LMS** | Group Squeezelite and Squeezebox players through Lyrion Music Server. |
+| **Sendspin / Music Assistant** | Add the player to Music Assistant and manage playback and groups from your Home Assistant audio setup. |
+| **AirPlay 2** | Use compatible Apple senders to select multiple AirPlay 2 receivers; Apple-device and multiroom qualification is still pending on this port. |
+
+Sendspin pairing and playback with Music Assistant are tested. Multi-player
+synchronization across these ecosystems is a separate qualification step and is
+not yet claimed as validated for this port. See [validation status](docs/STATUS.md).
 
 ## Install or build
 
