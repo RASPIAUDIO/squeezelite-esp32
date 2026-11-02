@@ -367,6 +367,8 @@ bool sb_displayer_init(void) {
 	
 	dsps_fft2r_init_fc32(meters.fft, FFT_LEN);
 	dsps_wind_hann_f32(meters.hanning, FFT_LEN);
+    extern void standalone_spectrum_init(void);
+    standalone_spectrum_init();
 		
 	// create displayer management task
 	displayer.mutex = xSemaphoreCreateMutex();

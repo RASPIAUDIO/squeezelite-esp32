@@ -111,6 +111,7 @@ const DefaultStringVal defaultStringVals[] = {
     {"telnet_block", "500"},
     {"stats", "n"},
     {"wifi_setup", "Y"},
+    {"spectrum", "Y"},
     {"improv_serial", "Y"},
     {"rel_api", CONFIG_RELEASE_API},
     {"pollmx", "600"},

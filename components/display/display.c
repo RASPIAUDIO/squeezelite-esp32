@@ -25,11 +25,16 @@
 #include "gds_font.h"
 #include "gds_image.h"
 #include "wifi_setup.h"
+#include "now_playing.h"
 
 static const char *TAG = "display";
 
 // Define global function pointer declared in display.h
 bool (*display_bus)(void *from, enum display_bus_cmd_e cmd) = NULL;
+bool (*display_spectrum)(uint8_t *levels, unsigned bands) = NULL;
+static bool spectrum_enabled = true;
+static uint8_t spectrum_levels[NOW_PLAYING_BANDS], spectrum_peaks[NOW_PLAYING_BANDS];
+static TickType_t spectrum_tick;
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
@@ -114,6 +119,17 @@ static const char *known_drivers[] = {"SH1106",
 static void displayer_task(void *args);
 static void display_sleep(void);
 static void displayer_artwork_locked(uint8_t *data);
+
+void displayer_spectrum_enable(bool enabled) {
+    if (!displayer.mutex) { spectrum_enabled = enabled; return; }
+    xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+    spectrum_enabled = enabled;
+    memset(spectrum_levels, 0, sizeof(spectrum_levels));
+    memset(spectrum_peaks, 0, sizeof(spectrum_peaks));
+    displayer.refresh = true;
+    xTaskNotifyGive(displayer.task);
+    xSemaphoreGive(displayer.mutex);
+}
 
 struct GDS_Device *display;   
 extern GDS_DetectFunc SSD1306_Detect, SSD132x_Detect, SH1106_Detect, SH1122_Detect, SSD1675_Detect, SSD1322_Detect, SSD1351_Detect, ST77xx_Detect, ILI9341_Detect;
@@ -206,9 +222,13 @@ void display_init(char *welcome) {
 		GDS_TextSetFontAuto(display, 2, GDS_FONT_LINE_2, -3);
 		
 		displayer.metadata_config = config_alloc_get(NVS_TYPE_STR, "metadata_config");
+
+        char *spectrum_config = config_alloc_get_str("spectrum", "Y", "Y");
+        spectrum_enabled = spectrum_config && !strcasecmp(spectrum_config, "Y");
+        free(spectrum_config);
 		
 		// leave room for artwork is display is horizontal-style
-		if (strcasestr(displayer.metadata_config, "artwork")) {
+		if (displayer.metadata_config && strcasestr(displayer.metadata_config, "artwork")) {
 			displayer.artwork.enable = true;
 			displayer.artwork.fit = true;
 			if (height <= 64 && width > height * 2) displayer.artwork.offset = width - height - ARTWORK_BORDER;
@@ -257,6 +277,41 @@ static void displayer_task(void *args) {
 			scroll_sleep = 0;
 			continue;
 		}
+        /* Independent of LMS: the common displayer owns this framebuffer.
+         * Small/monochrome displays keep their original two-line layout. */
+        if (now_playing_supported(display)) {
+            TickType_t tick = xTaskGetTickCount();
+            if (displayer.timer) {
+                uint32_t seconds = (tick - displayer.tick) * portTICK_PERIOD_MS / 1000;
+                displayer.elapsed += seconds;
+                displayer.tick += pdMS_TO_TICKS(seconds * 1000);
+            }
+            if (displayer.refresh) scroll_sleep = 0;
+            if (scroll_sleep <= 10) {
+                now_playing_title(display, displayer.string, displayer.offset);
+                scroll_sleep = displayer.offset ? displayer.speed : displayer.pause;
+                displayer.offset = displayer.offset >= displayer.boundary ? 0 :
+                    displayer.offset + min(displayer.by, displayer.boundary - displayer.offset);
+            }
+            now_playing_info(display, displayer.header, displayer.elapsed);
+            if (spectrum_enabled && (displayer.refresh || tick - spectrum_tick >= pdMS_TO_TICKS(100))) {
+                if (display_spectrum) display_spectrum(spectrum_levels, NOW_PLAYING_BANDS);
+                now_playing_spectrum(display, spectrum_levels, spectrum_peaks);
+                spectrum_tick = tick;
+            } else if (displayer.refresh) {
+                now_playing_spectrum(display, NULL, spectrum_peaks);
+            }
+            if (!displayer.artwork.updated && tick - displayer.artwork.tick > pdMS_TO_TICKS(5000))
+                displayer_artwork_locked((uint8_t *)default_artwork);
+            displayer.refresh = false;
+            displayer.artwork.pending_flush = false;
+            GDS_Update(display);
+            xSemaphoreGive(displayer.mutex);
+            TickType_t start = xTaskGetTickCount();
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(min(100, max(10, scroll_sleep))));
+            scroll_sleep -= (xTaskGetTickCount() - start) * portTICK_PERIOD_MS;
+            continue;
+        }
 		if (displayer.refresh) {
 			// little trick when switching master while in IDLE and missing it
 			GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.header);	
@@ -343,6 +398,24 @@ static void displayer_task(void *args) {
  */
 static void displayer_artwork_locked(uint8_t *data) {
 	if (!displayer.artwork.active) return;
+
+    if (now_playing_supported(display)) {
+        int w = 0, h = 0, side = now_playing_cover_size(display);
+        uint16_t *pixels = NULL;
+        if (data) {
+            GDS_GetJPEGSize(data, &w, &h);
+            if (w > 0 && h > 0) {
+                float scale = w > h ? (float)side / w : (float)side / h;
+                pixels = GDS_DecodeJPEG(data, &w, &h, scale, display->Mode);
+            }
+        }
+        now_playing_cover(display, pixels, w, h);
+        displayer.artwork.updated = pixels != NULL;
+        displayer.artwork.tick = xTaskGetTickCount();
+        displayer.artwork.pending_flush = true;
+        free(pixels);
+        return;
+    }
 	
 	int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
 	int y = x ? 0 : 32;
@@ -380,6 +453,7 @@ void *displayer_image_decode(const uint8_t *data, size_t length) {
     int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
     int y = x ? 0 : 32;
     int width = min(208, display->Width - x), height = min(208, display->Height - y);
+    if (now_playing_supported(display)) width = height = now_playing_cover_size(display);
     int mode = display->Mode;
     xSemaphoreGive(displayer.mutex);
     prepared_image_t *image = calloc(1, sizeof(*image));
@@ -408,10 +482,15 @@ bool displayer_image_show(void *ptr) {
     if (ok) {
         // Framebuffer-only: safe inside audio ownership critical section.
         // The normal display task performs the subsequent SPI update.
+        if (now_playing_supported(display)) {
+            now_playing_cover(display, image ? (uint16_t *)image->pixels : NULL,
+                              image ? image->width : 0, image ? image->height : 0);
+        } else {
         GDS_ClearWindow(display, x, y, -1, -1, GDS_COLOR_BLACK);
         if (image) GDS_DrawRGB(display, image->pixels,
             (display->Width+x-image->width)/2, (display->Height+y-image->height)/2,
             image->width, image->height, image->mode);
+        }
         displayer.artwork.updated = image != NULL;
         displayer.artwork.tick = xTaskGetTickCount();
         displayer.artwork.pending_flush = true;
@@ -436,13 +515,24 @@ void displayer_metadata(char *artist, char *album, char *title) {
 	if (!display) return;
 	
 	// just do title if there is no config set
-	if (!displayer.metadata_config) {
+	if (!displayer.metadata_config && !now_playing_supported(display)) {
 		strncpy(displayer.string, title ? title : "", SCROLLABLE_SIZE);
 		return;
 	}
 	
 	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
 	
+	if (now_playing_supported(display)) {
+        snprintf(string, SCROLLABLE_SIZE + 1, "%s%s%s", title ? title : "",
+                 title && *title && artist && *artist ? " - " : "", artist ? artist : "");
+        utf8_decode(string);
+        displayer.offset = 0;
+        displayer.boundary = max(0, now_playing_title_width(string) - (display->Width - 16));
+        displayer.refresh = true;
+        xTaskNotifyGive(displayer.task);
+        xSemaphoreGive(displayer.mutex);
+        return;
+    }
 	// format metadata parameters and write them directly
 	if ((p = strcasestr(displayer.metadata_config, "format")) != NULL) {
 		char token[16], *q;
@@ -567,8 +657,16 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 	case DISPLAYER_ACTIVATE: {	
 		char *header = va_arg(args, char*);
 		displayer.artwork.active = displayer.artwork.enable && va_arg(args, int);
+        if (now_playing_supported(display)) displayer.artwork.active = true;
+        displayer.artwork.updated = displayer.artwork.pending_flush = false;
+        displayer.artwork.tick = xTaskGetTickCount();
+        memset(spectrum_levels, 0, sizeof(spectrum_levels));
+        memset(spectrum_peaks, 0, sizeof(spectrum_peaks));
 		strncpy(displayer.header, header, HEADER_SIZE);
 		displayer.header[HEADER_SIZE] = '\0';
+        if (now_playing_supported(display)) ESP_LOGI(TAG,
+            "Standalone now-playing: %s, cover %dx%d, spectrum %s", header,
+            now_playing_cover_size(display), now_playing_cover_size(display), spectrum_enabled ? "enabled" : "disabled");
 		displayer.state = DISPLAYER_ACTIVE;
 		displayer.timer = false;
 		displayer.refresh = true;
@@ -577,7 +675,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 		displayer.duration.visible = false;
 		displayer.offset = displayer.boundary = 0;
 		display_bus(&displayer, DISPLAY_BUS_TAKE);
-		if (displayer.artwork.active) GDS_SetTextWidth(display, displayer.artwork.offset);
+		if (displayer.artwork.active) GDS_SetTextWidth(display, now_playing_supported(display) ? 0 : displayer.artwork.offset);
 		GDS_Clear(display, GDS_COLOR_BLACK);
 		xTaskNotifyGive(displayer.task);
 		break;
@@ -585,7 +683,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 	case DISPLAYER_SUSPEND:		
 		// Finish the final line before transferring display ownership to LMS.
 		if (displayer.state == DISPLAYER_ACTIVE) {
-			GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
+			if (!now_playing_supported(display)) GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
 			displayer_artwork_locked(NULL);
 		}
 		displayer.state = DISPLAYER_IDLE;

@@ -37,6 +37,7 @@
 #include "messaging.h"				  
 #include "platform_console.h"
 #include "tools.h"
+#include "display.h"
 #if CONFIG_HEAP_TRACING_STANDALONE && CONFIG_IDF_TARGET_ESP32S31
 #include "esp_heap_trace.h"
 #endif
@@ -88,6 +89,7 @@ static void register_factory_boot();
 static void register_restart_ota();
 static void register_set_services();
 static void register_wifi_setup();
+static void register_spectrum();
 static void register_improv_serial();
 #if WITH_TASKS_INFO
 static void register_tasks();
@@ -106,6 +108,7 @@ void register_system()
     register_setdevicename();
     register_set_services();
     register_wifi_setup();
+    register_spectrum();
     register_improv_serial();
     register_free();
     register_heap();
@@ -870,6 +873,31 @@ static void register_wifi_setup(void) {
         .func=do_wifi_setup, .argtable=&wifi_setup_args,
     };
     cmd_to_json_with_cb(&cmd,&wifi_setup_cb);
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+static struct { struct arg_lit *enable; struct arg_end *end; } spectrum_args;
+static int do_spectrum(int argc, char **argv) {
+    if (arg_parse_msg(argc, argv, (struct arg_hdr **)&spectrum_args)) return 1;
+    bool enabled = spectrum_args.enable->count != 0;
+    esp_err_t err = config_set_value(NVS_TYPE_STR, "spectrum", enabled ? "Y" : "N");
+    if (err == ESP_OK) displayer_spectrum_enable(enabled);
+    cmd_send_messaging(argv[0], err == ESP_OK ? MESSAGING_INFO : MESSAGING_ERROR,
+        err == ESP_OK ? "Standalone spectrum setting saved and applied. Audio is unchanged." : "Could not save spectrum setting.");
+    return err;
+}
+static cJSON *spectrum_cb(void) {
+    cJSON *v = cJSON_CreateObject();
+    console_set_bool_parameter(v, "spectrum", spectrum_args.enable);
+    return v;
+}
+static void register_spectrum(void) {
+    spectrum_args.enable = arg_lit0(NULL, "enable", "Enable animated spectrum bars (without LMS)");
+    spectrum_args.end = arg_end(1);
+    const esp_console_cmd_t cmd = {.command = CFG_TYPE_SYST("spectrum"),
+        .help = "Now playing display - visual spectrum only, no audio equalization",
+        .func = do_spectrum, .argtable = &spectrum_args};
+    cmd_to_json_with_cb(&cmd, &spectrum_cb);
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 

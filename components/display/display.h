@@ -50,3 +50,7 @@ char * display_get_supported_drivers(void);
 
 // Recovery AP credentials only; never the saved router password. NULL hides.
 void displayer_wifi_setup(const char *ssid, const char *password, const char *ip, bool open);
+
+// Optional PCM visualizer provider. Called only by the standalone display task.
+extern bool (*display_spectrum)(uint8_t *levels, unsigned bands);
+void displayer_spectrum_enable(bool enabled);

@@ -147,7 +147,8 @@ static void ap2_output_metadata(uint32_t epoch, const char *artist, const char *
     audio_source_lock();
     if (ap2_output_owns(epoch)) {
         displayer_metadata((char *)artist, (char *)album, (char *)title);
-        displayer_timer(DISPLAYER_ELAPSED, position, duration);
+        // Receiver metadata is in seconds; the common display API uses ms.
+        displayer_timer(DISPLAYER_ELAPSED, position * 1000, duration * 1000);
     }
     audio_source_unlock();
 }
@@ -157,9 +158,10 @@ static void ap2_output_artwork(uint32_t epoch, const uint8_t *data, size_t size)
     void *image = displayer_image_decode(data, size);
     if (!image) return;
     audio_source_lock();
-    bool shown = ap2_output_owns(epoch) && displayer_image_show(image);
+    if (ap2_output_owns(epoch)) displayer_image_show(image);
     audio_source_unlock();
-    if (!shown) displayer_image_free(image);
+    // show() copies into the framebuffer; it never takes image ownership.
+    displayer_image_free(image);
 }
 
 static const mn_airplay2_output_t ap2_output_ops = {

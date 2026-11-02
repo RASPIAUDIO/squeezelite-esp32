@@ -36,7 +36,7 @@ Music Assistant playback for your Home Assistant audio setup, with local connect
 </tr>
 <tr>
 <td valign="top"><strong>Color display</strong><br>
-Album artwork and track information on an ILI9341 screen.</td>
+Album artwork, scrolling track information and optional animated spectrum bars, including standalone playback without LMS.</td>
 <td valign="top"><strong>Easier first install</strong><br>
 On-screen Wi-Fi QR code and captive portal, or Improv Serial setup in the web installer after flashing.</td>
 </tr>
@@ -131,6 +131,16 @@ single QR code to join the setup network. See [display settings and rendering va
   The local web interface contains Services, Sendspin, audio, display and NVS settings.
   AirPlay 2 is enabled by default; disabling it selects the legacy AirPlay 1 receiver
   while the main AirPlay service remains enabled. Save and reboot to apply.
+
+## Standalone now-playing screen
+
+With a configured color LCD, standalone playback uses a large album-art area,
+scrolling title/artist text and blue spectrum bars on a black background.
+The bars are enabled by default and can be switched off in the local web
+interface under **System → Now playing display**. This visual option does not
+change audio equalization. Artwork availability still depends on the source;
+Bluetooth artwork is not added by this feature.
+See [layout, controls and validation](docs/STANDALONE-DISPLAY.md).
 
 ## Hardware and pinout
 

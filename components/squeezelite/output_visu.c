@@ -33,7 +33,11 @@ void output_visu_export(void *frames, frames_t out_frames, u32_t rate, bool sile
 	
 	// no data to process
 	if (silence) {
-		visu->running = false;
+        if (!pthread_mutex_trylock(&visu->mutex)) {
+            visu->running = false;
+            visu->level = 0;
+            pthread_mutex_unlock(&visu->mutex);
+        }
 		return;
 	}	
 	
@@ -45,7 +49,7 @@ void output_visu_export(void *frames, frames_t out_frames, u32_t rate, bool sile
 		// stuff buffer up and wait for consumer to read it (should reset level)
 		if (visu->level < visu->size) {
 			u32_t space = min(visu->size - visu->level, out_frames) * BYTES_PER_FRAME;
-			memcpy(visu->buffer + visu->level, frames, space);
+			memcpy((u8_t *)visu->buffer + visu->level * BYTES_PER_FRAME, frames, space);
 			
 			visu->level += space / BYTES_PER_FRAME;
 			visu->running = true;
