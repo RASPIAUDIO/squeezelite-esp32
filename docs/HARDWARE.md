@@ -33,6 +33,22 @@ The drawing also shows optional tactile wiring: **leave it disconnected** for th
 Leave LCD pins 8...14 disconnected. No microSD, no MISO, no backlight PWM.
 Use 3.3 V for this documented module wiring, not a blanket 5 V substitution.
 
+For this IPS panel, use `invert` in `display_config` in addition to `cswap`:
+
+```text
+SPI,width=320,height=240,cs=40,reset=43,speed=10000000,driver=ILI9341,cswap,invert
+```
+
+This selects the panel inversion command `0x21`, as specified in
+[LCDwiki's ILI9341V initialization sequence](https://www.lcdwiki.com/res/MSP2833_MSP2834/ILI9341V_Init.txt).
+It is a panel-specific setting, not a new default for every ILI9341 display.
+If black backgrounds appear white and QR codes appear negative, check this setting.
+
+The Wi-Fi setup screen uses a blue SqueezeLite ESP32-S31 header, a dark background, one
+black-on-white Wi-Fi QR code, and plain-text SSID, password, IP and setup URL.
+Credentials wrap within the screen margins; the QR retains a four-module quiet zone.
+See [the renderer checks](WIFI-SETUP-RENDERING.md).
+
 ![LCD reference wiring](assets/cablage-msp2834-s31.png)
 
 S31 component-side view, USB-C sockets down and RJ45 to the right: J2 is at the top,
