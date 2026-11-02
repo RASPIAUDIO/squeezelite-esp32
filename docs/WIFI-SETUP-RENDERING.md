@@ -33,3 +33,17 @@ requires the `invert` layout flag; see [Hardware](HARDWARE.md#lcd).
 
 Test output uses synthetic/default example credentials. Never commit real NVS
 dumps or saved Wi-Fi passwords.
+
+## Device validation — 2026-11-02
+
+Firmware `s31-wifi-ui-20261102` was flashed to the S31 Function-CoreBoard-1
+(application partition only, flash hash verified). The boot log confirmed the
+new firmware, the persisted MSP2834 `invert` setting and successful QR rendering.
+All eight host rendering cases passed.
+
+The user confirmed on the physical 320x240 display: **SqueezeLite ESP32-S31**
+header, black background, blue banner, no QR stripes and all information inside
+the frame. Phone scanning of this new layout was not separately reported.
+
+Application binary SHA-256:
+`868d2da80d85dcde619c99eb840c89aa7cf58dbfc9a745f11562c6aa842fda60`.
