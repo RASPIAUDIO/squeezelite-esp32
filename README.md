@@ -108,6 +108,16 @@ The webloader installs the firmware and offers Wi-Fi setup after flashing.
 If the captive portal does not open automatically, use the URL shown on screen.
 **Prefer Ethernet?** Plug in the cable and open the player's local web interface.
 
+<p align="center">
+  <img src="docs/assets/wifi-setup-s31.png" alt="SqueezeLite ESP32-S31 Wi-Fi setup screen with a blue header, one Wi-Fi QR code and readable connection details" width="480">
+</p>
+
+<p align="center"><em>320 × 240 framebuffer preview of the Wi-Fi setup screen, with example credentials.
+The layout was also validated on the physical ILI9341 display.</em></p>
+
+The screen keeps the SSID, password, IP address and setup URL visible, with a
+single QR code to join the setup network. See [display settings and rendering validation](docs/WIFI-SETUP-RENDERING.md).
+
 ## Install or build
 
 - Install with the **[RASPIAUDIO webloader](https://apps.raspiaudio.com/)**,
