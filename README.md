@@ -135,11 +135,11 @@ single QR code to join the setup network. See [display settings and rendering va
 ## Standalone now-playing screen
 
 <p align="center">
-  <img src="docs/assets/standalone-now-playing.png" alt="Standalone playback screen: scrolling title, blue spectrum bars on the left, large artwork on the right, black background and no brand header" width="480">
+  <img src="docs/assets/standalone-now-playing-photo.jpg" alt="Photo of the S31 display playing through Sendspin: scrolling title, blue spectrum bars on the left and album artwork on the right" width="600">
 </p>
 
-<p align="center"><em>320 × 240 production-renderer preview with synthetic artwork.
-The animated bands were confirmed on the physical display on November 3, 2026.</em></p>
+<p align="center"><em>Actual 320 × 240 display during Sendspin playback, photographed by the project owner.
+Animated bands confirmed on November 3, 2026.</em></p>
 
 With a configured color LCD, standalone playback uses a large album-art area,
 scrolling title/artist text and blue spectrum bars on a black background.

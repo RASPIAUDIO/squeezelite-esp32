@@ -6,10 +6,11 @@ white scrolling title/artist text, a 208 x 208 artwork area on the right, and
 twelve blue spectrum bars with white peaks on the left. Playback has no brand
 header. The time and source label sit below the spectrum.
 
-![Production renderer preview with synthetic artwork](assets/standalone-now-playing.png)
+![Physical S31 display during Sendspin playback](assets/standalone-now-playing-photo.jpg)
 
-This preview is rendered from the production GDS code with synthetic artwork;
-it is not a photograph of the device.
+Photograph supplied by the project owner on 2026-11-03: Sendspin playback with
+track text, album artwork and the blue spectrum bars. The synthetic
+[host-renderer preview](assets/standalone-now-playing.png) is retained for comparison.
 
 ## Setting
 
