@@ -95,8 +95,10 @@ int main(){
  set(MetadataProgressObject{0,240000,0}); expect(false,0); // paused at beginning is valid
  set(std::nullopt); expect(true,0); // radio without position
  set(MetadataProgressObject{0,0,0}); expect(true,0); // empty placeholder timeline
- set(MetadataProgressObject{0,0,1000}); expect(false,0); // unknown duration, usable position
- clock_us+=2000000; expect(false,2);
+ set(MetadataProgressObject{0,0,1000}); expect(true,0); // MA radio has speed but no duration
+ set(MetadataProgressObject{12000,0,1000}); expect(true,0); // real MA radio with elapsed position
+ clock_us+=5000000; expect(true,0); // radio must remain LIVE as its server clock advances
+ clock_us+=2000000; expect(true,0);
  listener.on_metadata_clear(); expect(true,0); // no stale clock after clear
  set(MetadataProgressObject{179000,180000,1000}); clock_us+=5000000; expect(false,180);
  listener.active=false; set(MetadataProgressObject{99000,180000,1000}); expect(false,180);

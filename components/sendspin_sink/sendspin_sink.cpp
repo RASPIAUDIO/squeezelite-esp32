@@ -177,10 +177,9 @@ struct Listener : PlayerRoleListener, MetadataRoleListener, ArtworkRoleListener,
         int64_t now=client->now_us();
         if (now<next_progress) return;
         next_progress=now+250000;
-        // An absent/empty timeline is not a zero-length song. Use LIVE.
-        bool known=metadata.progress.has_value() &&
-            (metadata.progress->track_duration || metadata.progress->track_progress ||
-             metadata.progress->playback_speed);
+        // MA sends advancing progress for live radio, but no finite duration.
+        // Without a finite duration, present LIVE instead of time since tuning in.
+        bool known=metadata.progress.has_value() && metadata.progress->track_duration>0;
         // The library uses the synchronized server timestamp and playback speed.
         // Poll even without new metadata: it interpolates playback, freezes on
         // pause and replaces the anchor on seek. Never run a second local clock.
@@ -436,6 +435,13 @@ static void run_client() {
                 cJSON_AddNumberToObject(j,"pairings",records);
                 auto server=client.get_server_information();
                 cJSON_AddStringToObject(j,"server",server ? server->name.c_str() : "");
+                // Read-only diagnostics from the same metadata clock used by the LCD.
+                const auto &progress=listener.metadata.progress;
+                const bool progress_known=progress.has_value() && progress->track_duration>0;
+                cJSON_AddBoolToObject(j,"progress_known",progress_known);
+                cJSON_AddNumberToObject(j,"position_ms",progress_known ? listener.metadata_role->get_track_progress_ms() : 0);
+                cJSON_AddNumberToObject(j,"duration_ms",progress ? progress->track_duration : 0);
+                cJSON_AddNumberToObject(j,"playback_speed",progress ? progress->playback_speed : 0);
                 const auto &p=player.get_current_stream_params();
                 if(playing && p.is_complete()) {
                     cJSON_AddNumberToObject(j,"sample_rate",*p.sample_rate);
