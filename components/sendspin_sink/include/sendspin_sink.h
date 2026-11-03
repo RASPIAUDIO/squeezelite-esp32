@@ -20,6 +20,7 @@ typedef struct {
     bool (*image_show)(uint32_t epoch, void *image);
     void (*image_free)(void *image);
     bool (*owns)(uint32_t epoch);
+    void (*progress)(uint32_t epoch, bool known, uint32_t position_ms);
 } mn_sendspin_output_t;
 /* Web API: returned JSON/token strings must be freed by the caller. */
 bool mn_sendspin_enabled(bool fallback);

@@ -622,6 +622,7 @@ static uint32_t sendspin_begin(uint32_t rate, uint8_t depth, uint8_t channels) {
     if (decode.state != DECODE_STOPPED) decode.state = DECODE_ERROR;
     UNLOCK_O; UNLOCK_D;
     displayer_control(DISPLAYER_ACTIVATE, "SENDSPIN", true);
+    displayer_progress(false, 0);
     actrls_unset();
     audio_source_unlock();
     return epoch;
@@ -712,6 +713,12 @@ static bool sendspin_image_show(uint32_t epoch, void *image) {
     UNLOCK_O;
     return shown;
 }
+static void sendspin_progress(uint32_t epoch, bool known, uint32_t position_ms) {
+    LOCK_O;
+    if (epoch && epoch == mn_sendspin_output_epoch && output.external == DECODE_SENDSPIN)
+        displayer_progress(known, position_ms);
+    UNLOCK_O;
+}
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32S31
@@ -731,7 +738,7 @@ void register_external(void) {
     if (enable_sendspin) {
         const mn_sendspin_output_t ops = {sendspin_begin,sendspin_write,sendspin_end,
             sendspin_available,sendspin_volume,sendspin_metadata,
-            displayer_image_decode,sendspin_image_show,displayer_image_free,sendspin_owns};
+            displayer_image_decode,sendspin_image_show,displayer_image_free,sendspin_owns,sendspin_progress};
         if (!mn_sendspin_init(&ops)) LOG_WARN("Sendspin task creation failed");
     }
 #endif

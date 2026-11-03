@@ -170,6 +170,22 @@ struct Listener : PlayerRoleListener, MetadataRoleListener, ArtworkRoleListener,
     std::atomic<bool> active{false};
     std::atomic<uint32_t> epoch{0};
     ServerMetadataStateObject metadata;
+    MetadataRole *metadata_role=nullptr;
+    int64_t next_progress=0;
+    void present_progress() {
+        if (!active.load() || !metadata_role || !output.progress) return;
+        int64_t now=client->now_us();
+        if (now<next_progress) return;
+        next_progress=now+250000;
+        // An absent/empty timeline is not a zero-length song. Use LIVE.
+        bool known=metadata.progress.has_value() &&
+            (metadata.progress->track_duration || metadata.progress->track_progress ||
+             metadata.progress->playback_speed);
+        // The library uses the synchronized server timestamp and playback speed.
+        // Poll even without new metadata: it interpolates playback, freezes on
+        // pause and replaces the anchor on seek. Never run a second local clock.
+        output.progress(epoch.load(),known,known ? metadata_role->get_track_progress_ms() : 0);
+    }
     bool controls_dirty=false;
     bool paired_connection=false;
     void on_trust_changed(ConnectionTrust trust) override { paired_connection=trust==ConnectionTrust::USER; }
@@ -285,6 +301,7 @@ struct Listener : PlayerRoleListener, MetadataRoleListener, ArtworkRoleListener,
         epoch.store(token);
         { std::lock_guard<std::mutex> lock(feedback_mutex); feedback_epoch=token; }
         active.store(accepted);
+        next_progress=0;
         if (!accepted) { client->set_available(false); ESP_LOGW(TAG,"Output unavailable or format rejected"); return; }
         output.volume(token,player->get_volume(),player->get_muted());
         output.metadata(token,metadata.artist.value_or("").c_str(),metadata.album.value_or("").c_str(),metadata.title.value_or("").c_str());
@@ -305,9 +322,10 @@ struct Listener : PlayerRoleListener, MetadataRoleListener, ArtworkRoleListener,
     }
     void on_metadata(const ServerMetadataStateObject &m) override {
         metadata=m;
+        next_progress=0;
         if(active.load()) output.metadata(epoch.load(),m.artist.value_or("").c_str(),m.album.value_or("").c_str(),m.title.value_or("").c_str());
     }
-    void on_metadata_clear() override { metadata={}; if(active.load()) output.metadata(epoch.load(),"","",""); }
+    void on_metadata_clear() override { metadata={}; next_progress=0; if(active.load()) output.metadata(epoch.load(),"","",""); }
 };
 
 static void run_client() {
@@ -345,7 +363,8 @@ static void run_client() {
     listener.player=&player; listener.client=&client;
     player.set_listener(&listener);
     client.set_listener(&listener);
-    client.add_metadata().set_listener(&listener);
+    listener.metadata_role=&client.add_metadata();
+    listener.metadata_role->set_listener(&listener);
     ArtworkRoleConfig ac;
     ImageSlotPreference slot;
     slot.source=SendspinImageSource::ALBUM; slot.format=SendspinImageFormat::JPEG;
@@ -395,6 +414,7 @@ static void run_client() {
             }
             client.set_available(output.available());
             client.loop();
+            listener.present_progress();
             listener.present_image();
             listener.save_controls(store);
             if(client.now_us()>=next_snapshot) {

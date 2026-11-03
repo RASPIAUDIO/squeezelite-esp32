@@ -37,12 +37,12 @@ void now_playing_title(struct GDS_Device *d, const char *title, int offset) {
     /* The font clips at x=0; explicitly keep the left safe margin black. */
     rect(d, 0, 0, 8, 27, GDS_COLOR_BLACK);
 }
-void now_playing_info(struct GDS_Device *d, const char *source, uint32_t seconds) {
+void now_playing_info(struct GDS_Device *d, const char *source, uint32_t seconds, bool live) {
     int right = cover_x(d) - 8;
     char time[16];
     snprintf(time, sizeof(time), "%02lu:%02lu", (unsigned long)(seconds / 60), (unsigned long)(seconds % 60));
     rect(d, 8, d->Height - 62, right - 8, 58, GDS_COLOR_BLACK);
-    text(d, 8, d->Height - 56, right, time);
+    text(d, 8, d->Height - 56, right, live ? "LIVE" : time);
     text(d, 8, d->Height - 28, right, !strcmp(source,"BLUETOOTH") ? "BT" : source);
 }
 void now_playing_spectrum(struct GDS_Device *d, const uint8_t *levels, uint8_t *peaks) {

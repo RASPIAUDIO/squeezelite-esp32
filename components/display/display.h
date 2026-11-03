@@ -45,6 +45,9 @@ void *displayer_image_decode(const uint8_t *data, size_t length);
 bool displayer_image_show(void *image);
 void displayer_image_free(void *image);
 void displayer_timer(enum displayer_time_e mode, int elapsed, int duration);
+// Authoritative source position. Nonblocking, framebuffer task performs drawing.
+// Returns false when busy/inactive; the source should retry on its next poll.
+bool displayer_progress(bool known, uint32_t position_ms);
 bool displayer_can_artwork(void);
 char * display_get_supported_drivers(void);
 

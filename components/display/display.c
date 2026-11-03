@@ -57,6 +57,7 @@ static EXT_RAM_BSS_ATTR struct {
 	int offset, boundary;
 	char *metadata_config;
 	bool timer, refresh;
+    bool external_progress, live;
 	uint32_t elapsed;
 	struct {
 		uint32_t value;
@@ -293,7 +294,7 @@ static void displayer_task(void *args) {
                 displayer.offset = displayer.offset >= displayer.boundary ? 0 :
                     displayer.offset + min(displayer.by, displayer.boundary - displayer.offset);
             }
-            now_playing_info(display, displayer.header, displayer.elapsed);
+            now_playing_info(display, displayer.header, displayer.elapsed, displayer.live);
             if (spectrum_enabled && (displayer.refresh || tick - spectrum_tick >= pdMS_TO_TICKS(100))) {
                 if (display_spectrum) display_spectrum(spectrum_levels, NOW_PLAYING_BANDS);
                 now_playing_spectrum(display, spectrum_levels, spectrum_peaks);
@@ -337,6 +338,13 @@ static void displayer_task(void *args) {
 			}	
 		}	
 		
+        if (displayer.external_progress) {
+            char time[16];
+            snprintf(time, sizeof(time), "%02lu:%02lu", (unsigned long)(displayer.elapsed / 60),
+                     (unsigned long)(displayer.elapsed % 60));
+            GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_CLEAR, displayer.header);
+            GDS_TextLine(display, 1, GDS_TEXT_RIGHT, GDS_TEXT_UPDATE, displayer.live ? "LIVE" : time);
+        }
 		// handler elapsed track time
 		if (displayer.timer && displayer.state == DISPLAYER_ACTIVE) {
 			char line[19] = "-", *_line = line + 1; // [-]H:MM:SS / H:MM:SS
@@ -610,6 +618,22 @@ void displayer_scroll(char *string, int speed, int pause) {
 /****************************************************************************************
  * 
  */
+bool displayer_progress(bool known, uint32_t position_ms) {
+    if (!display || !displayer.mutex || xSemaphoreTake(displayer.mutex, 0) != pdTRUE) return false;
+    bool active = !setup_screen.active && displayer.state == DISPLAYER_ACTIVE;
+    if (active) {
+        uint32_t elapsed = known ? position_ms / 1000 : 0;
+        bool changed = !displayer.external_progress || displayer.live == known || displayer.elapsed != elapsed;
+        displayer.external_progress = true;
+        displayer.live = !known;
+        displayer.timer = false; // Source interpolation owns playback and pause timing.
+        displayer.elapsed = elapsed;
+        if (changed) xTaskNotifyGive(displayer.task);
+    }
+    xSemaphoreGive(displayer.mutex);
+    return active;
+}
+
 void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
 	// need a display!
 	if (!display) return;
@@ -669,6 +693,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
             now_playing_cover_size(display), now_playing_cover_size(display), spectrum_enabled ? "enabled" : "disabled");
 		displayer.state = DISPLAYER_ACTIVE;
 		displayer.timer = false;
+        displayer.external_progress = displayer.live = false;
 		displayer.refresh = true;
 		displayer.string[0] = '\0';
 		displayer.elapsed = displayer.duration.value = 0;

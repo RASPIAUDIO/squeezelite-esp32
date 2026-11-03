@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory() as tmp:
     GDS_Clear(&d,0);
     now_playing_cover(&d,art,80,80);
     now_playing_title(&d,"Blue Hours - North Coast",0);
-    now_playing_info(&d,"AIRPLAY",154);
+    now_playing_info(&d,"AIRPLAY",154,false);
     uint8_t levels[12]={12,32,48,85,65,38,24,32,44,55,36,18},peaks[12]={0};
     now_playing_spectrum(&d,levels,peaks);GDS_Update(&d);
     assert(d.TextWidth==99 && d.FontForceProportional && !d.FontForceMonospace);
@@ -33,10 +33,17 @@ with tempfile.TemporaryDirectory() as tmp:
     int side=now_playing_cover_size(&d),cx=d.Width-12-side;
     // Scrolling, long source names and spectrum clearing cannot overwrite artwork.
     now_playing_title(&d,"Long artist and title scrolling across the entire display",130);
-    now_playing_info(&d,"VERY LONG SOURCE NAME",99999);
+    now_playing_info(&d,"VERY LONG SOURCE NAME",99999,false);
     memset(peaks,0,sizeof(peaks));now_playing_spectrum(&d,NULL,peaks);GDS_Update(&d);
     for(int y=28;y<28+side;y++)for(int x=cx;x<cx+side;x++)assert(pixels[y*d.Width+x]==saved[y*d.Width+x]);
     for(int y=36;y<=d.Height-72;y++)for(int x=8;x<cx-12;x++)assert(pixels[y*d.Width+x]==0);
+    memcpy(pixels,saved,d.FramebufferSize);
+    now_playing_info(&d,"SENDSPIN",0,true);GDS_Update(&d);
+    bool live_changed=false;
+    for(int y=d.Height-56;y<d.Height-41;y++)for(int x=8;x<cx-8;x++)
+        live_changed |= pixels[y*d.Width+x]!=saved[y*d.Width+x];
+    assert(live_changed);
+    for(int y=28;y<28+side;y++)for(int x=cx;x<cx+side;x++)assert(pixels[y*d.Width+x]==saved[y*d.Width+x]);
     memcpy(pixels,saved,d.FramebufferSize);GDS_Update(&d);
     // Repeated animation and timer changes: emulate every real panel transfer.
     for (unsigned frame=0;frame<400;frame++) {
