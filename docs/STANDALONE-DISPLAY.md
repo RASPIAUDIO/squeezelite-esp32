@@ -72,8 +72,8 @@ was verified by esptool. Version: `s31-standalone-20261102`.
 - The web command descriptor exposes the checkbox. API save/readback passed
   for both states. Disabled state survived a reboot; enabled state was restored.
 - All ten host cases passed (two display sizes plus eight PCM depth/rate cases).
-- Physical confirmation of the final bar animation is still pending. This
-  short run is not a new endurance, Bluetooth, Sendspin or high-rate qualification.
+- The user confirmed the final display/bar-animation test on 2026-11-03.
+  This short run is not a new endurance, Bluetooth, Sendspin or high-rate qualification.
   The browser-control runtime was unavailable; web validation used the actual
   device API and the existing generic form-generation code, not a browser click test.
 

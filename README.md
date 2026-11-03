@@ -134,6 +134,13 @@ single QR code to join the setup network. See [display settings and rendering va
 
 ## Standalone now-playing screen
 
+<p align="center">
+  <img src="docs/assets/standalone-now-playing.png" alt="Standalone playback screen: scrolling title, blue spectrum bars on the left, large artwork on the right, black background and no brand header" width="480">
+</p>
+
+<p align="center"><em>320 × 240 production-renderer preview with synthetic artwork.
+The animated bands were confirmed on the physical display on November 3, 2026.</em></p>
+
 With a configured color LCD, standalone playback uses a large album-art area,
 scrolling title/artist text and blue spectrum bars on a black background.
 The bars are enabled by default and can be switched off in the local web
