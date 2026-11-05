@@ -135,11 +135,11 @@ single QR code to join the setup network. See [display settings and rendering va
 ## Standalone now-playing screen
 
 <p align="center">
-  <img src="docs/assets/standalone-now-playing-photo.jpg" alt="Photo of the S31 display playing through Sendspin: scrolling title, blue spectrum bars on the left and album artwork on the right" width="600">
+  <a href="docs/assets/s31-sendspin-display-setup.png"><img src="docs/assets/s31-sendspin-display-setup.png" alt="S31 prototype playing Goliath by Woodkid through Sendspin, with album artwork, blue spectrum bars and elapsed time on the LCD" width="600"></a>
 </p>
 
-<p align="center"><em>Actual 320 × 240 display during Sendspin playback, photographed by the project owner.
-Animated bands confirmed on November 3, 2026.</em></p>
+<p align="center"><em>The physical S31 prototype during Sendspin playback: album artwork,
+animated spectrum and elapsed time. Photo supplied by the project owner.</em></p>
 
 With a configured color LCD, standalone playback uses a large album-art area,
 scrolling title/artist text and blue spectrum bars on a black background.
@@ -150,6 +150,13 @@ Bluetooth artwork is not added by this feature.
 See [layout, controls and validation](docs/STANDALONE-DISPLAY.md).
 
 ## Hardware and pinout
+
+<p align="center">
+  <a href="docs/assets/s31-audio-v3-hardware-setup.png"><img src="docs/assets/s31-audio-v3-hardware-setup.png" alt="Top view of the ESP32-S31 Function-CoreBoard-1 wired to the RASPIAUDIO Audio+ V3 and LCD, with Ethernet connected" width="600"></a>
+</p>
+
+<p align="center"><em>Prototype wiring: ESP32-S31 Function-CoreBoard-1, external RASPIAUDIO
+Audio+ V3 DAC and LCD. Use the pinout below for connections; the headers are not pin-compatible.</em></p>
 
 Test board: **Espressif ESP32-S31 Function-CoreBoard-1**, 16 MB flash / 16 MB PSRAM,
 with YT8531 Ethernet, ES8311 codec and NS4150B speaker amplifier.
