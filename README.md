@@ -42,6 +42,13 @@ On-screen Wi-Fi QR code and captive portal, or Improv Serial setup in the web in
 </tr>
 </table>
 
+<p align="center">
+  <a href="docs/assets/s31-sendspin-display-setup.png"><img src="docs/assets/s31-sendspin-display-setup.png" alt="S31 prototype playing Goliath by Woodkid through Sendspin, with album artwork, blue spectrum bars and elapsed time on the LCD" width="600"></a>
+</p>
+
+<p align="center"><em>The physical S31 prototype during Sendspin playback: album artwork,
+animated spectrum and elapsed time. Photo supplied by the project owner.</em></p>
+
 See [validation status](#status) for tested configurations, AirPlay 2 qualification
 and DSP workload limits. Gigabit is the [documented hardware interface](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html),
 not a measured application throughput.
@@ -133,13 +140,6 @@ single QR code to join the setup network. See [display settings and rendering va
   while the main AirPlay service remains enabled. Save and reboot to apply.
 
 ## Standalone now-playing screen
-
-<p align="center">
-  <a href="docs/assets/s31-sendspin-display-setup.png"><img src="docs/assets/s31-sendspin-display-setup.png" alt="S31 prototype playing Goliath by Woodkid through Sendspin, with album artwork, blue spectrum bars and elapsed time on the LCD" width="600"></a>
-</p>
-
-<p align="center"><em>The physical S31 prototype during Sendspin playback: album artwork,
-animated spectrum and elapsed time. Photo supplied by the project owner.</em></p>
 
 With a configured color LCD, standalone playback uses a large album-art area,
 scrolling title/artist text and blue spectrum bars on a black background.
