@@ -61,49 +61,30 @@ static void Update16( struct GDS_Device* Device ) {
 	struct PrivateSpace *Private = (struct PrivateSpace*) Device->Private;
 		
 #ifdef SHADOW_BUFFER
-	uint32_t *optr = (uint32_t*) Private->Shadowbuffer, *iptr = (uint32_t*) Device->Framebuffer;
-	int FirstCol = Device->Width / 2, LastCol = 0, FirstRow = -1, LastRow = 0;  
-	
-	for (int r = 0; r < Device->Height; r++) {
-		// look for change and update shadow (cheap optimization = width is always a multiple of 2)
-		for (int c = 0; c < Device->Width / 2; c++, iptr++, optr++) {
-			if (*optr != *iptr) {
-				*optr = *iptr;
-				if (c < FirstCol) FirstCol = c;	
-				if (c > LastCol) LastCol = c;
-				if (FirstRow < 0) FirstRow = r;
-				LastRow = r;
-			}
-		}
-
-		// wait for a large enough window - careful that window size might increase by more than a line at once !
-		if (FirstRow < 0 || ((LastCol - FirstCol + 1) * (r - FirstRow + 1) * 4 < PAGE_BLOCK && r != Device->Height - 1)) continue;
-		
-		FirstCol *= 2;
-		LastCol = LastCol * 2 + 1;
-		SetRowAddress( Device, FirstRow + Private->Offset.Height, LastRow + Private->Offset.Height);
-		SetColumnAddress( Device, FirstCol + Private->Offset.Width, LastCol + Private->Offset.Width );
-		Device->WriteCommand( Device, ENABLE_WRITE );
-			
-		int ChunkSize = (LastCol - FirstCol + 1) * 2;
-			
-		// own use of IRAM has not proven to be much better than letting SPI do its copy
+	/* Fixed, full-width stripes keep the panel write window independent of
+	 * glyph/spectrum edges. Re-send their black margins as well as lit pixels.
+	 * Compare before copying, and only acknowledge a successful payload in the
+	 * shadow buffer so a failed write can be retried on the next refresh. */
+	const size_t row_bytes = Device->Width * 2;
+	int rows_per_chunk = Private->iRAM ? PAGE_BLOCK / row_bytes : 1;
+	if (rows_per_chunk < 1) rows_per_chunk = 1;
+	for (int row = 0; row < Device->Height; row += rows_per_chunk) {
+		int rows = min(rows_per_chunk, Device->Height - row);
+		size_t offset = row * row_bytes, size = rows * row_bytes;
+		uint8_t *source = Device->Framebuffer + offset;
+		uint8_t *shadow = Private->Shadowbuffer + offset;
+		if (!memcmp(source, shadow, size)) continue;
+		const uint8_t *payload = source;
 		if (Private->iRAM) {
-			uint8_t *optr = Private->iRAM;
-			for (int i = FirstRow; i <= LastRow; i++) {
-				memcpy(optr, Private->Shadowbuffer + (i * Device->Width + FirstCol) * 2, ChunkSize);
-				optr += ChunkSize;
-				if (optr - Private->iRAM <= (PAGE_BLOCK - ChunkSize) && i < LastRow) continue;
-				Device->WriteData(Device, Private->iRAM, optr - Private->iRAM);
-				optr = Private->iRAM;
-			}
-		} else for (int i = FirstRow; i <= LastRow; i++) {
-			Device->WriteData( Device, Private->Shadowbuffer + (i * Device->Width + FirstCol) * 2, ChunkSize );
-		}	
+			memcpy(Private->iRAM, source, size);
+			payload = Private->iRAM;
+		}
+		SetRowAddress(Device, row + Private->Offset.Height, row + rows - 1 + Private->Offset.Height);
+		SetColumnAddress(Device, Private->Offset.Width, Device->Width - 1 + Private->Offset.Width);
+		Device->WriteCommand(Device, ENABLE_WRITE);
+		if (Device->WriteData(Device, payload, size)) memcpy(shadow, payload, size);
+	}
 
-		FirstCol = Device->Width / 2; LastCol = 0;
-		FirstRow = -1;
-	}	
 #else
 	// always update by full lines
 	SetColumnAddress( Device, Private->Offset.Width, Device->Width - 1);

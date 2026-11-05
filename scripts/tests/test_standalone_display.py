@@ -38,6 +38,38 @@ with tempfile.TemporaryDirectory() as tmp:
     for(int y=28;y<28+side;y++)for(int x=cx;x<cx+side;x++)assert(pixels[y*d.Width+x]==saved[y*d.Width+x]);
     for(int y=36;y<=d.Height-72;y++)for(int x=8;x<cx-12;x++)assert(pixels[y*d.Width+x]==0);
     memcpy(pixels,saved,d.FramebufferSize);GDS_Update(&d);
+    // Repeated animation and timer changes: emulate every real panel transfer.
+    for (unsigned frame=0;frame<400;frame++) {
+        for(int i=0;i<12;i++)levels[i]=(frame*17+i*23)%101;
+        now_playing_spectrum(&d,levels,peaks);
+        now_playing_info(&d,"SENDSPIN",frame,false);
+        GDS_Update(&d);
+    }
+    memset(peaks,0,sizeof(peaks));now_playing_spectrum(&d,NULL,peaks);
+    now_playing_info(&d,"SENDSPIN",0,true);GDS_Update(&d);
+    unsigned short final[480*320];memcpy(final,pixels,d.FramebufferSize);
+    // An animated region after erasing must match the same scene drawn fresh.
+    GDS_Clear(&d,0);now_playing_info(&d,"SENDSPIN",0,true);
+    memset(peaks,0,sizeof(peaks));now_playing_spectrum(&d,NULL,peaks);GDS_Update(&d);
+    for(int y=36;y<d.Height-4;y++)for(int x=8;x<cx-8;x++)
+        assert(pixels[y*d.Width+x]==final[y*d.Width+x]);
+    memcpy(pixels,saved,d.FramebufferSize);GDS_Update(&d);
+    // Corrupt both margins of a panel row, then change its central pixel.
+    // A complete stripe must restore the margins from the clean framebuffer.
+    for(int fallback=0;fallback<2;fallback++) {
+        if(fallback){free(priv->iRAM);priv->iRAM=NULL;}
+        int row=d.Height-50;
+        panel[(row*d.Width)*2]^=0xff;
+        panel[(row*d.Width+d.Width-1)*2]^=0xff;
+        pixels[row*d.Width+20]^=0xffff;
+        GDS_Update(&d);
+        // Failed transfers must not advance the shadow: a later update retries.
+        pixels[row*d.Width+20]^=0xffff;
+        fail_payload=true;Update16(&d);
+        assert(memcmp(panel,pixels,d.FramebufferSize));
+        GDS_Update(&d);
+    }
+    memcpy(pixels,saved,d.FramebufferSize);GDS_Update(&d);
 ''' + host[end:]
     (t/'display_host.c').write_text(host)
     exe=t/'display.exe'

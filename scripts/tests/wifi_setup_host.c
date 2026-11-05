@@ -10,6 +10,7 @@
 static unsigned short pixels[480*320];
 static unsigned char panel[480*320*2];
 static int command,x0,x1,y0,y1,cursor;
+static bool fail_payload;
 static bool panel_command(struct GDS_Device*d,uint8_t c) {
     (void)d;command=c;if(c==0x2c)cursor=0;return true;
 }
@@ -18,6 +19,10 @@ static bool panel_data(struct GDS_Device*d,const uint8_t *data,size_t n) {
         assert(n==4);int lo=data[0]*256+data[1],hi=data[2]*256+data[3];
         if(command==0x2a){x0=lo;x1=hi;}else{y0=lo;y1=hi;}
     }else if(command==0x2c){
+        if(fail_payload){fail_payload=false;return false;}
+        // Every RGB565 payload must fill a newly addressed window in one burst.
+        assert(cursor==0 && n==(size_t)(x1-x0+1)*(y1-y0+1)*2);
+        assert(x0==0 && x1==d->Width-1);
         for(size_t i=0;i<n;i++,cursor++){
             int y=y0+cursor/((x1-x0+1)*2),x=x0+(cursor/2)%(x1-x0+1);
             assert(y<=y1 && x<d->Width && y<d->Height);
